@@ -163,22 +163,19 @@ for dir_path in os_dir.values():
 # ============================================================================
 SHEET_ID = "1ic3oeMukAoQKVRkaJAs55f9bTpAACvzXmBLKc_1Kq2A"
 
-service_account = {
-    "type": "service_account",
-    "project_id": "psychic-valve-379909",
-    "private_key_id": "1acfb016be67af8bcf9844c6573f4330380df57f",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQCzk0ta5IkIiFsK\ng1RQAWPqtOSPOsPQEigXw8id0TFYuMR6zfm4sWQN4Ybtzhu4Km9DcpNV3Gyab7C/\n1lSxh0rd+Pmse5IWut2kXLogE6r8Q48ZYAJVniFR5uh9Ja4RcaR8Bep93XS2ZQoC\nPsKDiaJir31RPSluqPbbWmZFuRnbsrw1IceUCSxCg+L4Hu1B0qNhWsac5Cn2nWhi\nN/ikGvtd879OnzPOlOWJUEKb1XK6hBgDQvWehxR2wlXzEYxxtLAVH/xY8TAAMTYS\n+qslosoYX/D2HWgS7i24c+SFfImXZfQ4GGEqQL5ZhNIoQtU7BL/bGS6JLu+yenBf\n+04y+629AgMBAAECggEAA4hIvqWpRyywtcU7HFizRSYd7+4Z6zHz7fHl5apex0ft\nAmvdvoQ/ZV7QGTHkVO1QJefi1oVOe3Bzxp1Yx8Or65JXXH5fn9UlVP1bMSgIClE4\n+GPP71P7+h1OwobV6acB7nM79Oqjb3teGH7nFgGdAoFUwYF/ViU6aPW8zvk5EsMC\nYKi75sXWz/H2shP2trcetvLfTJxTJmlIQKDUZFD5D4Bn8Ggc6auoseRVzYbb0I2f\nJK+zptGYw/tQv7Ov7csetMwPKnSFSbRP98ADcM+QXploQdjTiVMGEDpgnkW3fwm8\nvtWbt0eEmafsY2WDjq5ABYrJQSro5Q2XxiDJhOQVtQKBgQD7iXyral0uI4Tljce7\nF/BN+tVlcGUrmYMV1MtBDp6GkRfdGi4wfsG8RjWbEzPSVNTtDW64sbzC1JFUS8qy\nom1l8HYs/rOv/kR1VKuFNpMZIL3FyoDzXupsS2Xm44jjap4WMppBHejBwfC6ao71\ncmj2DF3m/NJ4jqSDnQgeIr3N3wKBgQC2wvLD/+Y+Ya/fqn0LOrRsDjRXHk2zoLuT\nM0ieD3LdZ0bUpZ8kaSUSUOg283kzgkjl+gPE2Uuhj8inHOMNwecfog9C1s/jno++\nwq6BSPDQglUWSMVBswhiJjoTURvqRoEAgbPwHwJ0BrmdlNhcZF0sLSgBD8Xt8aae\n7YSWdQP/4wKBgQDv8yngg6i7+Nov+V5NFfsBCIVFLUD1pI2t5761IvMKv6KaIv1o\n+aJqrjc45cqLnK06LZQv0C2XVhwE5ABLBDOECS1Sou5atx4rJ0gv3e3ZDKi74/+7\nKhJKmGpvJSNSfkSsPD12XMfK/e1ch4Y0kp2aChYR4aANrVU20DgMN2wE1QKBgQCQ\ntnqt0dHJMWambwPGQXydVv4AwYD7K9l67A+jAE6Om3lNZbtGhG8TOrc008Lzk0UP\nvNEBLKIjUouqL0hmG1RcCuGUpi1EacgeX174Bf6Qy7J+C68Nn6qStPwlUYMOFTeO\nZCVLi/JQVwbgjPxo5BuWoEbd2FR8XWz2yNHEpPE+ywKBgQC0xGqdSPS+w/yeP/cL\nCWSBJQZ1tosnAHPmsneAJ0z2OYI0ALWUpbBZofTKznxyWOBRR99QPVZ4+4h3UOJi\nWBIVIhgfs4V/Br1A81NzaCYicEjFOZVzhRkuHNYZVfQAR298Jo0jeNaV4/FjMghu\njgigAqymis9eARjMapihe+eZ8w==\n-----END PRIVATE KEY-----\n",
-    "client_email": "sheet-etcd@psychic-valve-379909.iam.gserviceaccount.com",
-    "client_id": "107637598360658622635",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/sheet-etcd%40psychic-valve-379909.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
+# Load service account credentials from file
+SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_SERVICE_ACCOUNT_FILE', './service_account.json')
 
-gc = gspread.service_account_from_dict(service_account)
+if not os.path.exists(SERVICE_ACCOUNT_FILE):
+    logger.error(f"❌ Service account file not found: {SERVICE_ACCOUNT_FILE}")
+    logger.error(f"   Please create a service account JSON file from Google Cloud Console")
+    logger.error(f"   or set GOOGLE_SERVICE_ACCOUNT_FILE environment variable")
+    sys.exit(1)
+
+logger.info(f"📋 Loading Google Sheets credentials from: {SERVICE_ACCOUNT_FILE}")
+gc = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
 sh = gc.open_by_key(SHEET_ID)
+logger.info(f"✅ Connected to Google Sheet: {SHEET_ID}")
 
 # ============================================================================
 # GOOGLE SHEETS FUNCTIONS
