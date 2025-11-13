@@ -1,0 +1,13 @@
+{
+  "frame_processors": ["face_swapper"],
+  "keep_fps": true,
+  "keep_audio": true,
+  "keep_frames": true,
+  "many_faces": true,
+  "video_encoder": "libx264",
+  "video_quality": 18,
+  "max_memory": 14,
+  "execution_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+  "execution_threads": 18,
+  "headless": true
+}

@@ -11,6 +11,7 @@ psutil>=5.9.5
 torch>=2.8.0
 torchvision>=0.23.0
 onnxruntime>=1.20.0
+onnxruntime-gpu==1.20.1
 tqdm>=4.66.4
 ftfy
 regex

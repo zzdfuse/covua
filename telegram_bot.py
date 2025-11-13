@@ -311,10 +311,13 @@ def create_map_user_image():
     map_user_image = {}
     for i in data:
         if i[1] not in map_user_image:
+            # Sheet structure: [message_id, message_text, output_chat_id, topic_id, old_name, channel_id]
+            channel_id = i[5] if len(i) > 5 else None
             map_user_image[i[1]] = {
                 "chat_id": i[2],
                 "topic_id": i[3],
-                "message_id": i[0]
+                "message_id": i[0],
+                "channel_id": channel_id
             }
     return map_user_image
 
@@ -367,21 +370,45 @@ async def render_video(input_image, input_video, output_path):
         # Lazy load roop modules only when needed
         _ensure_roop_imported()
         
-        # Configure roop globals
+        # Load roop configuration from file
+        import json
+        roop_config_file = os.getenv('ROOP_CONFIG_FILE', './roop_config.json')
+        
+        if os.path.exists(roop_config_file):
+            logger.info(f"📋 Loading roop configuration from: {roop_config_file}")
+            with open(roop_config_file, 'r') as f:
+                roop_config = json.load(f)
+        else:
+            logger.warning(f"⚠️ Roop config file not found: {roop_config_file}, using defaults")
+            roop_config = {
+                "frame_processors": ["face_swapper"],
+                "keep_fps": True,
+                "keep_audio": True,
+                "keep_frames": True,
+                "many_faces": True,
+                "video_encoder": "libx264",
+                "video_quality": 18,
+                "max_memory": 14,
+                "execution_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                "execution_threads": 18,
+                "headless": True
+            }
+        
+        # Configure roop globals from config file
         _roop_globals.source_path = input_image
         _roop_globals.target_path = input_video
         _roop_globals.output_path = output_path
-        _roop_globals.frame_processors = ['face_swapper']
-        _roop_globals.keep_fps = True
-        _roop_globals.keep_audio = True
-        _roop_globals.keep_frames = True
-        _roop_globals.many_faces = True
-        _roop_globals.video_encoder = 'libx264'
-        _roop_globals.video_quality = 18
-        _roop_globals.max_memory = 14
-        _roop_globals.execution_providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        _roop_globals.execution_threads = 18
-        _roop_globals.headless = True
+        _roop_globals.frame_processors = roop_config.get('frame_processors', ['face_swapper'])
+        _roop_globals.keep_fps = roop_config.get('keep_fps', True)
+        _roop_globals.keep_audio = roop_config.get('keep_audio', True)
+        _roop_globals.keep_frames = roop_config.get('keep_frames', True)
+        _roop_globals.many_faces = roop_config.get('many_faces', True)
+        _roop_globals.video_encoder = roop_config.get('video_encoder', 'libx264')
+        _roop_globals.video_quality = roop_config.get('video_quality', 18)
+        _roop_globals.max_memory = roop_config.get('max_memory', 14)
+        _roop_globals.execution_providers = roop_config.get('execution_providers', ['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        _roop_globals.execution_threads = roop_config.get('execution_threads', 18)
+        _roop_globals.headless = roop_config.get('headless', True)
         
         logger.info(f"🔧 Roop configuration:")
         logger.info(f"   Source: {_roop_globals.source_path}")
@@ -848,6 +875,7 @@ async def domany(event):
 
             image_id = image_map[image_name].get("message_id")
             video_id = video_map[video_name].get("message_id")
+            channel_id = image_map[image_name].get("channel_id")
             output_exist = check_output_exist(f"{image_id}_{video_id}", current_data)
 
             try:
@@ -870,8 +898,15 @@ async def domany(event):
                 if os.path.exists(output_path):
                     logger.info(f"📤 Output file exists, sending to Telegram: {combo_name}")
                     output_thread = get_topic_id(image_id)
+                    
+                    # Send to forum topic
                     await send_video("output_chat_id", output_thread, output_path, combo_name)
-                    logger.info(f"✅ Video sent successfully: {combo_name}")
+                    logger.info(f"✅ Video sent to forum topic successfully: {combo_name}")
+                    
+                    # Send to channel if channel_id exists
+                    if channel_id:
+                        await client.send_file(int(channel_id), output_path, caption=combo_name)
+                        logger.info(f"✅ Video sent to channel successfully: {combo_name}")
                 else:
                     logger.info(f"🎬 Starting video rendering: {combo_name}")
                     output_thread = get_topic_id(image_id)
@@ -879,8 +914,15 @@ async def domany(event):
                     logger.info(f"🎬 Video rendering completed: {combo_name}")
 
                     logger.info(f"📤 Sending rendered video to Telegram: {combo_name}")
+                    
+                    # Send to forum topic
                     await send_video("output_chat_id", output_thread, output_path, combo_name)
-                    logger.info(f"✅ Video sent successfully: {combo_name}")
+                    logger.info(f"✅ Video sent to forum topic successfully: {combo_name}")
+                    
+                    # Send to channel if channel_id exists
+                    if channel_id:
+                        await client.send_file(int(channel_id), output_path, caption=combo_name)
+                        logger.info(f"✅ Video sent to channel successfully: {combo_name}")
 
                 await send_message("input_chat_id", thread_map["etcd"], f"✅ {combo_name} completed successfully")
                 sh.worksheet("list_output").append_row([f"{image_id}_{video_id}", combo_name])

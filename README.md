@@ -61,6 +61,47 @@ options:
 
 Looking for a CLI mode? Using the -s/--source argument will make the run program in cli mode.
 
+## Telegram Bot Configuration
+
+### Roop Configuration File
+
+The Telegram bot uses `roop_config.json` to configure face-swapping settings. You can customize the following parameters:
+
+```json
+{
+  "frame_processors": ["face_swapper"],
+  "keep_fps": true,
+  "keep_audio": true,
+  "keep_frames": true,
+  "many_faces": true,
+  "video_encoder": "libx264",
+  "video_quality": 18,
+  "max_memory": 14,
+  "execution_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+  "execution_threads": 18,
+  "headless": true
+}
+```
+
+**Parameters:**
+- `frame_processors`: List of processors to use (e.g., `["face_swapper", "face_enhancer"]`)
+- `keep_fps`: Preserve original video FPS
+- `keep_audio`: Keep original audio track
+- `keep_frames`: Save temporary frames (useful for debugging)
+- `many_faces`: Process all faces in the video (not just the first one)
+- `video_encoder`: Output codec (`libx264`, `libx265`, `libvpx-vp9`)
+- `video_quality`: Quality setting (lower = better, 18 is recommended)
+- `max_memory`: Maximum RAM usage in GB
+- `execution_providers`: Acceleration backends (`CUDAExecutionProvider` for GPU, `CPUExecutionProvider` for CPU)
+- `execution_threads`: Number of parallel threads
+- `headless`: Run without GUI
+
+**Environment Variable:**
+Set `ROOP_CONFIG_FILE` to use a different config file path:
+```bash
+export ROOP_CONFIG_FILE=/path/to/custom_config.json
+```
+
 ## Credits
 - [henryruhs](https://github.com/henryruhs): for being an irreplaceable contributor to the project
 - [ffmpeg](https://ffmpeg.org/): for making video related operations easy
