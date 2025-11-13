@@ -1,0 +1,42 @@
+# ⚠️  IMPORTANT: DO NOT USE "pip install -r requirements.txt" on Google Colab!
+# The standard requirements.txt will cause dependency conflicts with Colab's environment.
+#
+# For Google Colab installation, see COLAB_SETUP.md or use this command-by-command approach:
+#
+# Step 1: Install system dependencies
+#   !apt-get update -qq && apt-get install -y -qq ffmpeg
+#
+# Step 2: Install Python packages (one by one to avoid conflicts)
+#   !pip install -q customtkinter==5.1.3 opennsfw2==0.10.2 opencv-python-headless==4.10.0.84
+#   !pip install -q onnx==1.16.1 insightface==0.7.3 albucore==0.0.16 psutil==5.9.6
+#   !pip install -q ftfy regex pyvirtualcam gradio==5.9.1
+#   !pip install -q onnxruntime-gpu==1.20.1
+#
+# DO NOT install torch/torchvision - Colab already has compatible versions!
+#
+# Known Issues on Colab:
+# - NumPy version conflicts (Colab needs >=2.0, roop works better with 1.26.4)
+# - CUDA version mismatch (Colab has 12.6, standard requirements use 12.4)
+# - Torch version conflicts (Colab has 2.8.0, standard requirements install 2.5.1)
+#
+# If you must use a requirements file format, here are the Colab-compatible packages:
+
+customtkinter==5.1.3
+opennsfw2==0.10.2
+opencv-python-headless==4.10.0.84
+onnx==1.16.1
+insightface==0.7.3
+albucore==0.0.16
+psutil==5.9.6
+ftfy
+regex
+pyvirtualcam
+gradio==5.9.1
+onnxruntime-gpu==1.20.1
+
+# Note: Intentionally NOT including:
+# - torch (use Colab's pre-installed version)
+# - torchvision (use Colab's pre-installed version)  
+# - numpy (use Colab's pre-installed numpy>=2.0)
+# - tqdm (use Colab's pre-installed version)
+# - websockets (gradio needs 14.2, but google-adk wants >=15.0.1 - ignore this conflict)

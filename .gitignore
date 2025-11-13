@@ -1,0 +1,17 @@
+*.session
+.venv
+.git
+
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.idea/
+.vscode/
+logs/
+
+# Google service account credentials
+service_account.json
+*service_account*.json
+
+test/

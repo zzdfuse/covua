@@ -1,0 +1,16 @@
+# Requirements for telegram_bot.py
+# Install with: pip install -r requirements-telegram-bot.txt
+
+# Telegram client (1.36+ required for CreateForumTopicRequest in messages module)
+telethon>=1.36.0
+
+# Google Sheets integration
+gspread>=6.0.0
+
+# Note: Roop dependencies should already be installed via requirements.txt or requirements-colab.txt
+# This file only includes additional dependencies needed for the Telegram bot functionality
+
+# Compatibility Note:
+# - Telethon 1.36-1.41: CreateForumTopicRequest was in channels module
+# - Telethon 1.42+: CreateForumTopicRequest moved to messages module
+# The code now correctly imports from messages module for v1.42+
