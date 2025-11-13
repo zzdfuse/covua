@@ -1,0 +1,13 @@
+*.session
+.venv
+.git
+
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.idea/
+.vscode/
+logs/
+
+test/

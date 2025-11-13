@@ -19,6 +19,8 @@ Users of this software are expected to use this software responsibly while abidi
 
 - **Acceleration:** If you have a good GPU and are ready for solving any software issues you may face, you can enable GPU which is wayyy faster. To do this, first follow the basic install instructions given above and then follow GPU-specific instructions [here](https://github.com/s0md3v/roop/wiki/2.-Acceleration).
 
+- **🆕 Google Colab:** Want to try it without installing anything? See [COLAB_SETUP.md](COLAB_SETUP.md) for step-by-step instructions to run on Google Colab with free T4 GPU.
+
 ## How do I use it?
 > Note: When you run this program for the first time, it will download some models ~300MB in size.
 
