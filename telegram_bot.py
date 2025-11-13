@@ -741,8 +741,22 @@ async def handle_image_has_text(event):
             else:
                 reply_message = await event.reply(f"⚠️ Failed to update channel '{old_text}'")
         else:
-            logger.warning(f"⚠️ No channel_id found for message {message_id}, cannot update channel")
-            reply_message = await event.reply(f"⚠️ No channel associated with '{old_text}'")
+            # Old record without channel - create one now
+            logger.info(f"🆕 No channel exists for message {message_id}, creating new channel: {message_text}")
+            new_channel_id = await create_separate_chat(message_text, event.message)
+            
+            if new_channel_id:
+                # Update the sheet with new channel_id in column F (index 5)
+                sh.worksheet("list_image").update_acell(f"F{row_idx+2}", new_channel_id)
+                # Also update name columns if changed
+                if old_text != message_text:
+                    sh.worksheet("list_image").update_acell(f"B{row_idx+2}", message_text)
+                    sh.worksheet("list_image").update_acell(f"E{row_idx+2}", message_text)
+                logger.info(f"✅ Created new channel with ID: {new_channel_id}")
+                reply_message = await event.reply(f"✅ Channel created for '{message_text}'")
+            else:
+                logger.error(f"❌ Failed to create channel for message {message_id}")
+                reply_message = await event.reply(f"⚠️ Failed to create channel for '{message_text}'")
         
         sleep(2)
         await reply_message.delete()
