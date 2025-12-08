@@ -25,6 +25,7 @@ import sys
 from time import sleep
 import logging
 from datetime import datetime
+from asyncio import Queue
 
 from telethon import TelegramClient, events
 from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
@@ -91,6 +92,14 @@ def log_separator(title=""):
         logger.info(f"{'='*20} {title} {'='*20}")
     else:
         logger.info("="*50)
+
+# ============================================================================
+# VIDEO RENDERING QUEUE
+# ============================================================================
+# Global queue for video rendering tasks - ensures one video renders at a time
+# while keeping the bot responsive to other operations
+render_queue = Queue()
+render_worker_task = None
 
 # ============================================================================
 # TELEGRAM CONFIGURATION
@@ -359,9 +368,9 @@ async def download_file(message_id, sub_path=".", ext="jpg"):
         logger.error(f"❌ Failed to download file {message_id}: {e}")
         raise
 
-async def render_video(input_image, input_video, output_path):
+async def render_video_sync(input_image, input_video, output_path):
     """
-    Render video using roop directly (not subprocess)
+    Synchronous video rendering - runs in executor to avoid blocking
     This calls roop's internal functions instead of running as a separate process
     """
     logger.info(f"🎬 Starting video render: {input_video} with image {input_image} → {output_path}")
@@ -438,6 +447,79 @@ async def render_video(input_image, input_video, output_path):
     except Exception as e:
         logger.error(f"❌ Video render failed: {e}")
         raise
+
+async def render_video(input_image, input_video, output_path):
+    """
+    Async wrapper for video rendering - runs blocking render_video_sync in executor
+    """
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: asyncio.run(render_video_sync(input_image, input_video, output_path)))
+
+async def process_render_queue():
+    """
+    Worker that processes video rendering tasks one at a time from the queue
+    This ensures only one video renders at a time while keeping bot responsive
+    """
+    logger.info("🎬 Video render queue worker started")
+    while True:
+        try:
+            # Get next rendering task from queue
+            task_data = await render_queue.get()
+            
+            if task_data is None:  # Shutdown signal
+                logger.info("🛑 Render queue worker shutting down")
+                break
+            
+            combo_name = task_data['combo_name']
+            input_image = task_data['input_image']
+            input_video = task_data['input_video']
+            output_path = task_data['output_path']
+            output_thread = task_data['output_thread']
+            channel_id = task_data['channel_id']
+            image_id = task_data['image_id']
+            video_id = task_data['video_id']
+            
+            logger.info(f"🎬 Queue: Processing render for {combo_name}")
+            
+            try:
+                # Render the video (this blocks, but we're in a dedicated worker)
+                await render_video(input_image, input_video, output_path)
+                logger.info(f"🎬 Video rendering completed: {combo_name}")
+                
+                # Send to forum topic
+                await send_video("output_chat_id", output_thread, output_path, combo_name)
+                logger.info(f"✅ Video sent to forum topic successfully: {combo_name}")
+                
+                # Send to channel if channel_id exists
+                if channel_id:
+                    await client.send_file(int(channel_id), output_path, caption=combo_name)
+                    logger.info(f"✅ Video sent to channel successfully: {combo_name}")
+                
+                # Mark as successful in sheets
+                await send_message("input_chat_id", thread_map["etcd"], f"✅ {combo_name} completed successfully")
+                sh.worksheet("list_output").append_row([f"{image_id}_{video_id}", combo_name])
+                logger.info(f"✅ Successfully completed: {combo_name}")
+                
+                # Notify about success
+                if 'tracking_message' in task_data and task_data['tracking_message']:
+                    await task_data['success_callback'](combo_name)
+                
+            except Exception as e:
+                logger.error(f"❌ Queue: Failed to render {combo_name}: {e}")
+                await send_message("group", thread_map["etcd"], f"❌ {combo_name} failed: {str(e)}")
+                
+                # Notify about failure
+                if 'tracking_message' in task_data and task_data['tracking_message']:
+                    await task_data['failure_callback'](combo_name, str(e))
+            
+            finally:
+                # Mark task as done
+                render_queue.task_done()
+                
+        except Exception as e:
+            logger.error(f"❌ Render queue worker error: {e}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
 
 async def create_forum_topic(topic_name, chat_id):
     logger.info(f"🆕 Creating forum topic: '{topic_name}' in chat {chat_id}")
@@ -873,6 +955,7 @@ async def domany(event):
     progress = 0
     success = 0
     skip = 0
+    queued = 0
     fail_list = []
 
     tracking_message = await send_message("group", thread_map["output"], 
@@ -880,6 +963,22 @@ async def domany(event):
     image_map = create_map_user_image()
     video_map = create_map_video()
     current_data = get_data("list_output")
+
+    # Callbacks for tracking updates from queue worker
+    async def success_callback(combo_name):
+        nonlocal success
+        success += 1
+        tracking_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | 🔄 Queued: {queued} | ❌ Fail: {len(fail_list)}"
+        if fail_list:
+            tracking_content += f"\n\n❌ Failed items:\n{chr(10).join(fail_list)}"
+        await edit_message(tracking_message, tracking_content)
+
+    async def failure_callback(combo_name, error_msg):
+        fail_list.append(combo_name)
+        tracking_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | 🔄 Queued: {queued} | ❌ Fail: {len(fail_list)}"
+        if fail_list:
+            tracking_content += f"\n\n❌ Failed items:\n{chr(10).join(fail_list)}"
+        await edit_message(tracking_message, tracking_content)
 
     for image_name in image_names:
         for video_name in video_names:
@@ -898,7 +997,7 @@ async def domany(event):
                     skip += 1
                     continue
 
-                tracking_message_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | ❌ Fail: {len(fail_list)}\n🔄 Current: {combo_name}"
+                tracking_message_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | 🔄 Queued: {queued} | ❌ Fail: {len(fail_list)}\n🔄 Current: {combo_name}"
                 await edit_message(tracking_message, tracking_message_content)
 
                 logger.info(f"📥 Downloading files for {combo_name}")
@@ -921,27 +1020,32 @@ async def domany(event):
                     if channel_id:
                         await client.send_file(int(channel_id), output_path, caption=combo_name)
                         logger.info(f"✅ Video sent to channel successfully: {combo_name}")
+                    
+                    await send_message("input_chat_id", thread_map["etcd"], f"✅ {combo_name} completed successfully")
+                    sh.worksheet("list_output").append_row([f"{image_id}_{video_id}", combo_name])
+                    success += 1
                 else:
-                    logger.info(f"🎬 Starting video rendering: {combo_name}")
+                    # Queue the rendering task instead of blocking
+                    logger.info(f"🔄 Queueing video rendering: {combo_name}")
                     output_thread = get_topic_id(image_id)
-                    await render_video(input_image, input_video, output_path)
-                    logger.info(f"🎬 Video rendering completed: {combo_name}")
-
-                    logger.info(f"📤 Sending rendered video to Telegram: {combo_name}")
                     
-                    # Send to forum topic
-                    await send_video("output_chat_id", output_thread, output_path, combo_name)
-                    logger.info(f"✅ Video sent to forum topic successfully: {combo_name}")
+                    task_data = {
+                        'combo_name': combo_name,
+                        'input_image': input_image,
+                        'input_video': input_video,
+                        'output_path': output_path,
+                        'output_thread': output_thread,
+                        'channel_id': channel_id,
+                        'image_id': image_id,
+                        'video_id': video_id,
+                        'tracking_message': tracking_message,
+                        'success_callback': success_callback,
+                        'failure_callback': failure_callback
+                    }
                     
-                    # Send to channel if channel_id exists
-                    if channel_id:
-                        await client.send_file(int(channel_id), output_path, caption=combo_name)
-                        logger.info(f"✅ Video sent to channel successfully: {combo_name}")
-
-                await send_message("input_chat_id", thread_map["etcd"], f"✅ {combo_name} completed successfully")
-                sh.worksheet("list_output").append_row([f"{image_id}_{video_id}", combo_name])
-                success += 1
-                logger.info(f"✅ Successfully completed: {combo_name}")
+                    await render_queue.put(task_data)
+                    queued += 1
+                    logger.info(f"✅ {combo_name} queued for rendering (queue size: {render_queue.qsize()})")
 
             except Exception as e:
                 logger.error(f"❌ FAILED processing {combo_name}: {str(e)}")
@@ -949,7 +1053,7 @@ async def domany(event):
                 fail_list.append(combo_name)
 
             finally:
-                tracking_message_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | ❌ Fail: {len(fail_list)}"
+                tracking_message_content = f"📊 Progress: {progress}/{total}\n✅ Success: {success} | ⚡ Skip: {skip} | 🔄 Queued: {queued} | ❌ Fail: {len(fail_list)}"
                 if fail_list:
                     tracking_message_content += f"\n\n❌ Failed items:\n{chr(10).join(fail_list)}"
                 await edit_message(tracking_message, tracking_message_content)
@@ -958,9 +1062,14 @@ async def domany(event):
     logger.info(f"   📊 Total processed: {progress}/{total}")
     logger.info(f"   ✅ Successful: {success}")
     logger.info(f"   ⚡ Skipped: {skip}")
+    logger.info(f"   🔄 Queued: {queued}")
     logger.info(f"   ❌ Failed: {len(fail_list)}")
     if fail_list:
         logger.info(f"   📝 Failed items: {', '.join(fail_list)}")
+    
+    # Notify user that tasks are queued
+    if queued > 0:
+        await event.reply(f"✅ Batch queued: {queued} videos will render in background. Bot remains responsive!")
 
 def is_topic_reply(topic, event):
     if event.reply_to.reply_to_msg_id == entity_map["input_chat_id"]["threads"][topic]:
@@ -1114,6 +1223,8 @@ async def delete_video_command(event):
 # ============================================================================
 async def main():
     """Main function to run the Telegram bot"""
+    global render_worker_task
+    
     log_separator("STARTING TELEGRAM CLIENT")
     logger.info("🚀 Starting Telegram clients...")
 
@@ -1121,14 +1232,20 @@ async def main():
         await client.start()
         await personal_client.start()
         logger.info("✅ Both clients started successfully")
+        
+        # Start the render queue worker
+        render_worker_task = asyncio.create_task(process_render_queue())
+        logger.info("🎬 Video render queue worker started")
+        
         logger.info("👂 Bot is now listening for events...")
         logger.info("🔧 Available commands:")
-        logger.info("   • /domany <images> <videos> - Start batch processing")
+        logger.info("   • /domany <images> <videos> - Start batch processing (non-blocking)")
         logger.info("   • /get_chat_id - Get current chat ID")
         logger.info("   • /getres - List available resources")
         logger.info("   • /delete_image <name> - Manually delete image by name")
         logger.info("   • /delete_video <name> - Manually delete video by name")
         logger.info("🗑️ Auto-deletion enabled: Deleting messages will remove entries from sheets")
+        logger.info("⚡ Non-blocking rendering: Bot stays responsive while processing videos")
         log_separator()
         print("Start Polling")
 
@@ -1140,6 +1257,12 @@ async def main():
             logger.info("⚠️ Received keyboard interrupt")
         finally:
             logger.info("🛑 Stopping bot...")
+            
+            # Stop the render queue worker gracefully
+            await render_queue.put(None)  # Send shutdown signal
+            if render_worker_task:
+                await render_worker_task
+            
             print("Stopping")
             await client.disconnect()
             logger.info("✅ Bot stopped successfully")
