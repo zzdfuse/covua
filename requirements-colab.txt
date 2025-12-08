@@ -32,7 +32,7 @@ ftfy
 regex
 pyvirtualcam
 gradio==5.9.1
-onnxruntime-gpu==1.20.1
+onnxruntime-gpu>=1.20.1
 
 # Note: Intentionally NOT including:
 # - torch (use Colab's pre-installed version)
