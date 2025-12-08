@@ -7,7 +7,7 @@
   "video_encoder": "libx264",
   "video_quality": 18,
   "max_memory": 14,
-  "execution_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+  "execution_providers": ["CUDAExecutionProvider"],
   "execution_threads": 18,
   "headless": true
 }
