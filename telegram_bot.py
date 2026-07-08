@@ -94,6 +94,44 @@ def log_separator(title=""):
         logger.info("="*50)
 
 # ============================================================================
+# SD INPAINTING CONFIGURATION (etcd thread — cloth removal)
+# ============================================================================
+_sd_pipe = None
+_seg_model = None
+
+SD_MODEL_ID    = os.getenv('SD_MODEL_ID', 'Uminosachi/realisticVisionV51_v51VAE-inpainting')
+SD_PROMPT      = (
+    'RAW photo, (masterpiece:1.3), (best quality:1.3), (ultra-realistic:1.2), '
+    'photorealistic, hyperrealism, DSLR, 85mm lens, f/1.8, soft bokeh, '
+    '(bare skin:1.4), (nude:1.3), (no clothing:1.3), '
+    'Vietnamese woman, Southeast Asian female, (warm golden skin tone:1.2), '
+    '(smooth flawless skin:1.2), realistic skin texture, visible skin pores, '
+    'subsurface scattering, natural skin sheen, '
+    '(slim petite figure:1.2), toned athletic body, natural feminine curves, '
+    '(symmetrical natural breasts:1.3), (proportional chest:1.2), correct anatomy, '
+    'soft studio lighting, natural shadows, 8k uhd, sharp focus, film grain'
+)
+SD_NEGATIVE    = (
+    '(worst quality:2), (low quality:2), (normal quality:2), (bad quality:2), '
+    'lowres, jpeg artifacts, signature, watermark, username, blurry, '
+    '(bad anatomy:1.8), (deformed:1.6), (malformed:1.6), (mutated:1.6), '
+    '(extra limbs:1.5), (extra arms:1.5), (extra legs:1.5), (missing limbs:1.5), '
+    '(fused fingers:1.5), (too many fingers:1.5), (extra fingers:1.5), '
+    '(uneven breasts:1.6), (asymmetrical breasts:1.6), (deformed breasts:1.6), '
+    '(oversized breasts:1.4), (bad proportions:1.5), long neck, cross-eyed, '
+    'clothing, shirt, t-shirt, jacket, coat, vest, bra, underwear, fabric, garment, dressed, covered, '
+    '(plastic skin:1.4), (doll:1.4), (mannequin:1.4), (3d render:1.3), '
+    'cartoon, anime, painting, drawing, sketch, illustration, '
+    'caucasian, western features, dark skin, tan lines, '
+    'ugly, duplicate, morbid, mutilated, out of frame'
+)
+SD_GUIDANCE    = float(os.getenv('SD_GUIDANCE', '7.5'))
+SD_STRENGTH    = float(os.getenv('SD_STRENGTH', '0.78'))
+SD_STEPS       = int(os.getenv('SD_STEPS', '75'))
+SD_TARGET_SIZE = int(os.getenv('SD_TARGET_SIZE', '512'))
+SD_SEED        = int(os.getenv('SD_SEED', '42'))
+
+# ============================================================================
 # VIDEO RENDERING QUEUE
 # ============================================================================
 # Global queue for video rendering tasks - ensures one video renders at a time
@@ -786,6 +824,126 @@ async def send_video(chat_name, thread_id, video_path, caption=""):
     return await client.send_file(get_entity_id(chat_name), video_path, reply_to=int(thread_id), caption=caption)
 
 # ============================================================================
+# SD INPAINTING HELPERS
+# ============================================================================
+def _ensure_sd_loaded():
+    global _sd_pipe, _seg_model
+    if _seg_model is not None and _sd_pipe is not None:
+        return
+    logger.info("📦 Loading SD inpainting models...")
+    import torch
+    import albumentations as albu
+    from diffusers import StableDiffusionInpaintPipeline
+    from cloths_segmentation.pre_trained_models import create_model
+
+    _seg_model = create_model('Unet_2020-10-30')
+    _seg_model.eval()
+
+    _sd_pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        SD_MODEL_ID,
+        torch_dtype=torch.float16,
+        safety_checker=None,
+        requires_safety_checker=False,
+    )
+    _sd_pipe.enable_attention_slicing()
+    _sd_pipe = _sd_pipe.to('cuda')
+    logger.info("✅ SD inpainting models loaded")
+
+
+def _run_inpaint_sync(image_bytes: bytes) -> bytes:
+    """Cloth-removal pipeline. Blocking — always call via run_in_executor."""
+    import io, cv2, torch, numpy as np, albumentations as albu
+    from PIL import Image
+    from iglovikov_helper_functions.utils.image_utils import pad, unpad
+    from iglovikov_helper_functions.dl.pytorch.utils import tensor_from_rgb_image
+
+    _ensure_sd_loaded()
+
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    image_np  = np.array(pil_image)
+
+    # Segmentation
+    transform = albu.Compose([albu.Normalize(p=1)], p=1)
+    padded, pads = pad(image_np, factor=32, border=cv2.BORDER_CONSTANT)
+    x = torch.unsqueeze(tensor_from_rgb_image(transform(image=padded)['image']), 0)
+    with torch.no_grad():
+        prediction = _seg_model(x)[0][0]
+    mask = (prediction > 0).cpu().numpy().astype(np.uint8)
+    mask = unpad(mask, pads)
+
+    # Dilate to cover all clothing edges
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=3)
+    mask = cv2.erode(mask,  kernel, iterations=1)
+
+    # Resize to SD-friendly dimensions
+    w, h = pil_image.size
+    if w > h:
+        nw, nh = SD_TARGET_SIZE, int(SD_TARGET_SIZE * h / w)
+    else:
+        nw, nh = int(SD_TARGET_SIZE * w / h), SD_TARGET_SIZE
+    nw, nh = (nw // 8) * 8, (nh // 8) * 8
+
+    img_resized  = pil_image.resize((nw, nh), Image.LANCZOS)
+    mask_resized = Image.fromarray(mask * 255, mode='L').resize((nw, nh), Image.NEAREST)
+
+    # Inpaint
+    generator = torch.Generator(device='cuda').manual_seed(SD_SEED)
+    result = _sd_pipe(
+        prompt=SD_PROMPT,
+        negative_prompt=SD_NEGATIVE,
+        image=img_resized,
+        mask_image=mask_resized,
+        num_inference_steps=SD_STEPS,
+        guidance_scale=SD_GUIDANCE,
+        strength=SD_STRENGTH,
+        height=nh,
+        width=nw,
+        generator=generator,
+    ).images[0]
+
+    # Blend — preserve non-masked pixels from original
+    mask_f  = np.array(mask_resized).astype(np.float32) / 255.0
+    mask_3c = np.stack([mask_f] * 3, axis=-1)
+    blended = np.array(result) * mask_3c + np.array(img_resized) * (1 - mask_3c)
+    final   = Image.fromarray(blended.astype(np.uint8)).resize(pil_image.size, Image.LANCZOS)
+
+    out = io.BytesIO()
+    final.save(out, format='JPEG', quality=95)
+    return out.getvalue()
+
+
+async def handle_etcd_image(event):
+    """Download image posted in group→etcd thread, inpaint, send result back."""
+    logger.info("🔥 ULTRA-AGGRESSIVE CLOTHING REMOVAL MODE ACTIVATED — etcd thread")
+    status = await client.send_message(
+        get_entity_id('group'),
+        '⏳ Processing... ULTRA-AGGRESSIVE CLOTHING REMOVAL MODE ACTIVATED 🔥',
+        reply_to=thread_map['etcd'],
+    )
+    try:
+        image_bytes = await client.download_media(event.message, bytes)
+        loop = asyncio.get_event_loop()
+        result_bytes = await loop.run_in_executor(None, _run_inpaint_sync, image_bytes)
+
+        import io as _io
+        buf = _io.BytesIO(result_bytes)
+        buf.name = 'result.jpg'
+        await client.send_file(
+            get_entity_id('group'),
+            buf,
+            reply_to=thread_map['etcd'],
+            caption='✅ Done!',
+        )
+        await status.delete()
+        logger.info("✅ Inpainting result sent to etcd thread")
+    except Exception as e:
+        logger.error(f"❌ Inpainting failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await status.edit(f'❌ Failed: {e}')
+
+# ============================================================================
 # MESSAGE HANDLERS
 # ============================================================================
 async def handle_image_no_text(event):
@@ -1218,6 +1376,16 @@ async def delete_video_command(event):
         logger.error(f"❌ Error in manual video deletion: {e}")
         await event.reply(f"❌ Error deleting video: {str(e)}")
 
+@client.on(events.NewMessage(chats=get_entity_id('group'), from_users=get_entity_id('user_id')))
+async def etcd_image_handler(event):
+    """Trigger SD inpainting when user posts a photo in the group etcd thread (375)."""
+    if not event.photo:
+        return
+    if not event.reply_to or event.reply_to.reply_to_msg_id != thread_map['etcd']:
+        return
+    logger.info(f"🖼️ Photo received in group etcd thread — starting inpainting (msg {event.message.id})")
+    await handle_etcd_image(event)
+
 # ============================================================================
 # MAIN FUNCTION
 # ============================================================================
@@ -1244,6 +1412,7 @@ async def main():
         logger.info("   • /getres - List available resources")
         logger.info("   • /delete_image <name> - Manually delete image by name")
         logger.info("   • /delete_video <name> - Manually delete video by name")
+        logger.info("🔥 SD inpainting: upload a photo to group etcd thread (375) to trigger cloth removal")
         logger.info("🗑️ Auto-deletion enabled: Deleting messages will remove entries from sheets")
         logger.info("⚡ Non-blocking rendering: Bot stays responsive while processing videos")
         log_separator()
