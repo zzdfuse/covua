@@ -40,7 +40,19 @@ def get_face_swapper() -> Any:
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
             model_path = resolve_relative_path('../models/inswapper_128.onnx')
-            FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=roop.globals.execution_providers)
+            # Pass CUDA provider options: arena allocator keeps GPU memory allocated
+            # between calls instead of malloc/free every frame, cutting overhead.
+            providers = []
+            for p in roop.globals.execution_providers:
+                if p == 'CUDAExecutionProvider':
+                    providers.append((p, {
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'do_copy_in_default_stream': True,
+                    }))
+                else:
+                    providers.append(p)
+            FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=providers)
     return FACE_SWAPPER
 
 

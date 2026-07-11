@@ -24,6 +24,12 @@ import os
 import sys
 from time import sleep
 import logging
+
+# Must be set before any torch/onnxruntime import — prevents CPU OpenMP thread explosion
+# which starves the GPU by keeping CPU cores busy with scheduling overhead.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('CUDA_MODULE_LOADING', 'LAZY')   # faster CUDA init
+os.environ.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
 from datetime import datetime
 from asyncio import Queue
 

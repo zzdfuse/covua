@@ -12,7 +12,9 @@ def get_face_analyser() -> Any:
 
     if FACE_ANALYSER is None:
         FACE_ANALYSER = insightface.app.FaceAnalysis(name='buffalo_l', providers=roop.globals.execution_providers)
-        FACE_ANALYSER.prepare(ctx_id=0, det_size=(640, 640))
+        # 320x320 is ~4x faster than 640x640 with negligible quality loss for typical video frames.
+        # Use 640 only if faces are very small in frame (e.g. crowd shots).
+        FACE_ANALYSER.prepare(ctx_id=0, det_size=(320, 320))
     return FACE_ANALYSER
 
 

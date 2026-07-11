@@ -44,13 +44,52 @@ def detect_fps(target_path: str) -> float:
 
 def extract_frames(target_path: str) -> None:
     temp_directory_path = get_temp_directory_path(target_path)
-    run_ffmpeg(['-threads', '16', '-i', target_path, '-pix_fmt', 'rgb24', os.path.join(temp_directory_path, '%04d.png')])
+    # JPEG is ~4-6x faster to read/write than PNG, keeping GPU fed with less I/O wait.
+    # q:v 1 = highest JPEG quality (virtually lossless for face swapping purposes).
+    run_ffmpeg(['-threads', '16', '-i', target_path, '-q:v', '1', os.path.join(temp_directory_path, '%04d.jpg')])
+
+
+def _nvenc_available() -> bool:
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True, text=True, timeout=5
+        )
+        return 'h264_nvenc' in result.stdout
+    except Exception:
+        return False
 
 
 def create_video(target_path: str, fps: float = 30.0) -> None:
     temp_output_path = get_temp_output_path(target_path)
     temp_directory_path = get_temp_directory_path(target_path)
-    run_ffmpeg(['-r', str(fps), '-i', os.path.join(temp_directory_path, '%04d.png'), '-c:v', roop.globals.video_encoder, '-crf', str(roop.globals.video_quality), '-pix_fmt', 'yuv420p', '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1', '-y', temp_output_path])
+    frame_pattern = os.path.join(temp_directory_path, '%04d.jpg')
+
+    # Prefer NVENC (GPU hardware encoder) — ~10x faster than libx264, frees CPU for other work.
+    # Fall back to the configured software encoder if NVENC is unavailable.
+    if _nvenc_available():
+        run_ffmpeg([
+            '-r', str(fps),
+            '-i', frame_pattern,
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p4',          # balanced speed/quality
+            '-tune', 'hq',
+            '-rc', 'vbr',
+            '-cq', str(roop.globals.video_quality),
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1',
+            '-y', temp_output_path,
+        ])
+    else:
+        run_ffmpeg([
+            '-r', str(fps),
+            '-i', frame_pattern,
+            '-c:v', roop.globals.video_encoder,
+            '-crf', str(roop.globals.video_quality),
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1',
+            '-y', temp_output_path,
+        ])
 
 
 def restore_audio(target_path: str, output_path: str) -> None:
@@ -62,7 +101,7 @@ def restore_audio(target_path: str, output_path: str) -> None:
 
 def get_temp_frame_paths(target_path: str) -> List[str]:
     temp_directory_path = get_temp_directory_path(target_path)
-    return glob.glob((os.path.join(glob.escape(temp_directory_path), '*.png')))
+    return sorted(glob.glob(os.path.join(glob.escape(temp_directory_path), '*.jpg')))
 
 
 def get_temp_directory_path(target_path: str) -> str:
