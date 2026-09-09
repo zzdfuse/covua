@@ -42,7 +42,10 @@ import gspread
 
 # Roop is invoked as a subprocess per render so each process gets isolated globals.
 # Concurrent renders share the GPU safely — onnxruntime handles multi-process CUDA access.
-ROOP_PATH = os.getenv('ROOP_PATH', '/content/myroop')
+# run.py lives alongside telegram_bot.py; ROOP_PATH only needed as a fallback for
+# external installs where run.py and roop/ are elsewhere.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOP_PATH = os.getenv('ROOP_PATH', SCRIPT_DIR)
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -390,8 +393,13 @@ async def render_video(input_image, input_video, output_path):
         with open(roop_config_file) as f:
             cfg = json.load(f)
 
+    # run.py lives next to telegram_bot.py; fall back to ROOP_PATH for external installs
+    run_py = os.path.join(SCRIPT_DIR, 'run.py')
+    if not os.path.exists(run_py):
+        run_py = os.path.join(ROOP_PATH, 'run.py')
+
     cmd = [
-        sys.executable, os.path.join(ROOP_PATH, 'run.py'),
+        sys.executable, run_py,
         '-s', input_image,
         '-t', input_video,
         '-o', output_path,
@@ -411,11 +419,19 @@ async def render_video(input_image, input_video, output_path):
 
     logger.info(f"🔧 Roop cmd: {' '.join(cmd)}")
 
-    env = {**os.environ, 'OMP_NUM_THREADS': '1', 'ROOP_PATH': ROOP_PATH}
+    # cwd=SCRIPT_DIR so relative paths (./image, ./video, ./output) resolve correctly.
+    # PYTHONPATH includes SCRIPT_DIR so subprocess can `import roop` from the local roop/ package.
+    existing_pythonpath = os.environ.get('PYTHONPATH', '')
+    env = {
+        **os.environ,
+        'OMP_NUM_THREADS': '1',
+        'PYTHONPATH': f"{SCRIPT_DIR}:{existing_pythonpath}" if existing_pythonpath else SCRIPT_DIR,
+    }
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=SCRIPT_DIR,
         env=env,
     )
     stdout, stderr = await proc.communicate()
