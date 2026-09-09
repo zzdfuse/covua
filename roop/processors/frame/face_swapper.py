@@ -14,6 +14,16 @@ FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
+_SOURCE_FACE_CACHE = {}
+_SOURCE_FACE_LOCK = threading.Lock()
+
+
+def _get_source_face(source_path: str):
+    with _SOURCE_FACE_LOCK:
+        if source_path not in _SOURCE_FACE_CACHE:
+            _SOURCE_FACE_CACHE[source_path] = get_one_face(cv2.imread(source_path))
+    return _SOURCE_FACE_CACHE[source_path]
+
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
@@ -77,7 +87,7 @@ def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
 
 
 def process_frames(source_path: str, temp_frame_paths: List[str], progress: Any = None) -> None:
-    source_face = get_one_face(cv2.imread(source_path))
+    source_face = _get_source_face(source_path)
     for temp_frame_path in temp_frame_paths:
         temp_frame = cv2.imread(temp_frame_path)
         try:

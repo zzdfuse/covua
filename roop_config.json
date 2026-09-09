@@ -6,8 +6,9 @@
   "many_faces": false,
   "video_encoder": "libx264",
   "video_quality": 23,
-  "max_memory": 14,
+  "max_memory": 6,
   "execution_providers": ["CUDAExecutionProvider"],
-  "execution_threads": 2,
+  "execution_threads": 4,
+  "concurrent_renders": 2,
   "headless": true
 }

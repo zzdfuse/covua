@@ -40,46 +40,9 @@ from telethon.tl.functions.messages import CreateForumTopicRequest
 from telethon.events import MessageDeleted
 import gspread
 
-# Roop modules will be imported lazily when needed
-# This prevents import errors when roop is not available
-_roop_imported = False
-_roop_globals = None
-_roop_start = None
-_pre_check = None
-_limit_resources = None
-_update_status = None
-_get_frame_processors_modules = None
-
-def _ensure_roop_imported():
-    """Lazy import roop modules only when needed"""
-    global _roop_imported, _roop_globals, _roop_start, _pre_check, _limit_resources, _update_status, _get_frame_processors_modules
-    
-    if not _roop_imported:
-        logger.info("📦 Loading roop modules...")
-        try:
-            # Add roop to path if not already there
-            roop_path = os.getenv('ROOP_PATH', '/content/myroop')
-            if roop_path not in sys.path:
-                sys.path.insert(0, roop_path)
-            
-            import roop.globals as rg
-            from roop.core import start as roop_start_func, pre_check as pre_check_func, limit_resources as limit_resources_func, update_status as update_status_func
-            from roop.processors.frame.core import get_frame_processors_modules as get_frame_processors_func
-            
-            _roop_globals = rg
-            _roop_start = roop_start_func
-            _pre_check = pre_check_func
-            _limit_resources = limit_resources_func
-            _update_status = update_status_func
-            _get_frame_processors_modules = get_frame_processors_func
-            
-            _roop_imported = True
-            logger.info("✅ Roop modules loaded successfully")
-        except Exception as e:
-            logger.error(f"❌ Failed to import roop modules: {e}")
-            logger.error(f"   Make sure roop is installed and ROOP_PATH is set correctly")
-            logger.error(f"   Current ROOP_PATH: {os.getenv('ROOP_PATH', '/content/myroop')}")
-            raise
+# Roop is invoked as a subprocess per render so each process gets isolated globals.
+# Concurrent renders share the GPU safely — onnxruntime handles multi-process CUDA access.
+ROOP_PATH = os.getenv('ROOP_PATH', '/content/myroop')
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -143,7 +106,7 @@ SD_SEED        = int(os.getenv('SD_SEED', '42'))
 # Global queue for video rendering tasks - ensures one video renders at a time
 # while keeping the bot responsive to other operations
 render_queue = Queue()
-render_worker_task = None
+render_worker_tasks = []
 
 # ============================================================================
 # TELEGRAM CONFIGURATION
@@ -412,92 +375,58 @@ async def download_file(message_id, sub_path=".", ext="jpg"):
         logger.error(f"❌ Failed to download file {message_id}: {e}")
         raise
 
-async def render_video_sync(input_image, input_video, output_path):
-    """
-    Synchronous video rendering - runs in executor to avoid blocking
-    This calls roop's internal functions instead of running as a separate process
-    """
-    logger.info(f"🎬 Starting video render: {input_video} with image {input_image} → {output_path}")
-    
-    try:
-        # Lazy load roop modules only when needed
-        _ensure_roop_imported()
-        
-        # Load roop configuration from file
-        import json
-        roop_config_file = os.getenv('ROOP_CONFIG_FILE', './roop_config.json')
-        
-        if os.path.exists(roop_config_file):
-            logger.info(f"📋 Loading roop configuration from: {roop_config_file}")
-            with open(roop_config_file, 'r') as f:
-                roop_config = json.load(f)
-        else:
-            logger.warning(f"⚠️ Roop config file not found: {roop_config_file}, using defaults")
-            roop_config = {
-                "frame_processors": ["face_swapper"],
-                "keep_fps": True,
-                "keep_audio": True,
-                "keep_frames": True,
-                "many_faces": True,
-                "video_encoder": "libx264",
-                "video_quality": 18,
-                "max_memory": 14,
-                "execution_providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
-                "execution_threads": 18,
-                "headless": True
-            }
-        
-        # Configure roop globals from config file
-        _roop_globals.source_path = input_image
-        _roop_globals.target_path = input_video
-        _roop_globals.output_path = output_path
-        _roop_globals.frame_processors = roop_config.get('frame_processors', ['face_swapper'])
-        _roop_globals.keep_fps = roop_config.get('keep_fps', True)
-        _roop_globals.keep_audio = roop_config.get('keep_audio', True)
-        _roop_globals.keep_frames = roop_config.get('keep_frames', True)
-        _roop_globals.many_faces = roop_config.get('many_faces', True)
-        _roop_globals.video_encoder = roop_config.get('video_encoder', 'libx264')
-        _roop_globals.video_quality = roop_config.get('video_quality', 18)
-        _roop_globals.max_memory = roop_config.get('max_memory', 14)
-        _roop_globals.execution_providers = roop_config.get('execution_providers', ['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        _roop_globals.execution_threads = roop_config.get('execution_threads', 18)
-        _roop_globals.headless = roop_config.get('headless', True)
-        
-        logger.info(f"🔧 Roop configuration:")
-        logger.info(f"   Source: {_roop_globals.source_path}")
-        logger.info(f"   Target: {_roop_globals.target_path}")
-        logger.info(f"   Output: {_roop_globals.output_path}")
-        logger.info(f"   Many faces: {_roop_globals.many_faces}")
-        logger.info(f"   Execution providers: {_roop_globals.execution_providers}")
-        
-        # Pre-check
-        if not _pre_check():
-            raise Exception("Roop pre-check failed")
-        
-        # Check frame processors
-        for frame_processor in _get_frame_processors_modules(_roop_globals.frame_processors):
-            if not frame_processor.pre_check():
-                raise Exception(f"Frame processor {frame_processor.NAME} pre-check failed")
-        
-        # Limit resources
-        _limit_resources()
-        
-        # Start processing
-        logger.info(f"🚀 Starting roop processing...")
-        _roop_start()
-        
-        logger.info(f"✅ Video render completed successfully: {output_path}")
-        
-    except Exception as e:
-        logger.error(f"❌ Video render failed: {e}")
-        raise
-
 async def render_video(input_image, input_video, output_path):
     """
-    Async wrapper for video rendering - runs blocking render_video_sync in executor
+    Render a face-swap video by spawning roop as a subprocess.
+    Each subprocess gets its own copy of roop.globals — no shared-state race conditions
+    when multiple renders run concurrently. The GPU is shared safely via CUDA.
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, lambda: asyncio.run(render_video_sync(input_image, input_video, output_path)))
+    logger.info(f"🎬 Starting video render: {input_video} with image {input_image} → {output_path}")
+
+    import json
+    roop_config_file = os.getenv('ROOP_CONFIG_FILE', './roop_config.json')
+    cfg = {}
+    if os.path.exists(roop_config_file):
+        with open(roop_config_file) as f:
+            cfg = json.load(f)
+
+    cmd = [
+        sys.executable, os.path.join(ROOP_PATH, 'run.py'),
+        '-s', input_image,
+        '-t', input_video,
+        '-o', output_path,
+        '--execution-provider', 'cuda',
+        '--execution-threads', str(cfg.get('execution_threads', 4)),
+        '--max-memory', str(cfg.get('max_memory', 6)),
+        '--video-encoder', cfg.get('video_encoder', 'libx264'),
+        '--video-quality', str(cfg.get('video_quality', 23)),
+        '--frame-processor', 'face_swapper',
+    ]
+    if cfg.get('many_faces', False):
+        cmd.append('--many-faces')
+    if cfg.get('keep_fps', True):
+        cmd.append('--keep-fps')
+    if cfg.get('keep_audio', True):
+        cmd.append('--keep-audio')
+
+    logger.info(f"🔧 Roop cmd: {' '.join(cmd)}")
+
+    env = {**os.environ, 'OMP_NUM_THREADS': '1', 'ROOP_PATH': ROOP_PATH}
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        raise Exception(f"Roop failed (exit {proc.returncode}):\n{stderr.decode(errors='replace')[-2000:]}")
+
+    if not os.path.exists(output_path):
+        raise Exception(f"Roop exited 0 but output file missing: {output_path}")
+
+    logger.info(f"✅ Video render completed: {output_path}")
 
 async def process_render_queue():
     """
@@ -1397,19 +1326,29 @@ async def etcd_image_handler(event):
 # ============================================================================
 async def main():
     """Main function to run the Telegram bot"""
-    global render_worker_task
-    
+    global render_worker_tasks
+
     log_separator("STARTING TELEGRAM CLIENT")
     logger.info("🚀 Starting Telegram clients...")
+
+    import json
+    roop_config_file = os.getenv('ROOP_CONFIG_FILE', './roop_config.json')
+    concurrent_renders = 1
+    if os.path.exists(roop_config_file):
+        with open(roop_config_file) as f:
+            concurrent_renders = json.load(f).get('concurrent_renders', 1)
 
     async with client, personal_client:
         await client.start()
         await personal_client.start()
         logger.info("✅ Both clients started successfully")
-        
-        # Start the render queue worker
-        render_worker_task = asyncio.create_task(process_render_queue())
-        logger.info("🎬 Video render queue worker started")
+
+        # Start N render queue workers (one per concurrent render slot)
+        render_worker_tasks = [
+            asyncio.create_task(process_render_queue())
+            for _ in range(concurrent_renders)
+        ]
+        logger.info(f"🎬 Started {concurrent_renders} render worker(s)")
         
         logger.info("👂 Bot is now listening for events...")
         logger.info("🔧 Available commands:")
@@ -1433,10 +1372,11 @@ async def main():
         finally:
             logger.info("🛑 Stopping bot...")
             
-            # Stop the render queue worker gracefully
-            await render_queue.put(None)  # Send shutdown signal
-            if render_worker_task:
-                await render_worker_task
+            # Send one shutdown signal per worker, then await all
+            for _ in render_worker_tasks:
+                await render_queue.put(None)
+            for task in render_worker_tasks:
+                await task
             
             print("Stopping")
             await client.disconnect()
