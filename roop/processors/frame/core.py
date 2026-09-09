@@ -39,11 +39,14 @@ def get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType
 
 
 def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_frames: Callable[[str, List[str], Any], None], progress: Any = None) -> None:
-    with ThreadPoolExecutor(max_workers=roop.globals.execution_threads) as executor:
-        futures = []
-        for path in temp_frame_paths:
-            future = executor.submit(process_frames, source_path, [path], progress)
-            futures.append(future)
+    threads = roop.globals.execution_threads
+    # Chunk frames across threads so each thread processes a contiguous slice.
+    # Avoids 669 separate future submissions (one per frame) which causes massive
+    # Python thread-pool overhead and GPU cold-start latency between calls.
+    chunk_size = max(1, len(temp_frame_paths) // threads)
+    chunks = [temp_frame_paths[i:i + chunk_size] for i in range(0, len(temp_frame_paths), chunk_size)]
+    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = [executor.submit(process_frames, source_path, chunk, progress) for chunk in chunks]
         for future in futures:
             future.result()
 

@@ -3,11 +3,11 @@
   "keep_fps": true,
   "keep_audio": true,
   "keep_frames": false,
-  "many_faces": true,
+  "many_faces": false,
   "video_encoder": "libx264",
   "video_quality": 23,
-  "max_memory": 12,
+  "max_memory": 14,
   "execution_providers": ["CUDAExecutionProvider"],
-  "execution_threads": 8,
+  "execution_threads": 2,
   "headless": true
 }
