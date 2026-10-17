@@ -421,6 +421,8 @@ async def render_video(input_image, input_video, output_path):
 
     # cwd=SCRIPT_DIR so relative paths (./image, ./video, ./output) resolve correctly.
     # PYTHONPATH includes SCRIPT_DIR so subprocess can `import roop` from the local roop/ package.
+    # stdout/stderr intentionally inherit from parent so roop's tqdm progress bars
+    # appear in real-time. Error detection falls back to returncode + output file check.
     existing_pythonpath = os.environ.get('PYTHONPATH', '')
     env = {
         **os.environ,
@@ -429,15 +431,13 @@ async def render_video(input_image, input_video, output_path):
     }
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
         cwd=SCRIPT_DIR,
         env=env,
     )
-    stdout, stderr = await proc.communicate()
+    await proc.wait()
 
     if proc.returncode != 0:
-        raise Exception(f"Roop failed (exit {proc.returncode}):\n{stderr.decode(errors='replace')[-2000:]}")
+        raise Exception(f"Roop subprocess failed with exit code {proc.returncode}")
 
     if not os.path.exists(output_path):
         raise Exception(f"Roop exited 0 but output file missing: {output_path}")
@@ -1051,9 +1051,44 @@ async def handle_message_deleted(event):
         logger.info(f"ℹ️ No matching entries found in sheets for deleted messages")
 
 async def domany(event):
-    message = event.message.text.split(" ")
-    image_names = message[1].split(",")
-    video_names = message[2].split(",")
+    message_parts = event.message.text.strip().split()
+    if len(message_parts) < 3:
+        await event.reply("⚠️ Usage: `/domany <images|all> <videos|all>`")
+        return
+
+    image_map = create_map_user_image()
+    video_map = create_map_video()
+
+    raw_images = message_parts[1].strip()
+    raw_videos = message_parts[2].strip()
+
+    # Expand 'all' or comma-separated list
+    if raw_images.lower() == "all":
+        image_names = list(image_map.keys())
+    else:
+        image_names = [x.strip().lower() for x in raw_images.split(",") if x.strip()]
+
+    if raw_videos.lower() == "all":
+        video_names = list(video_map.keys())
+    else:
+        video_names = [x.strip().lower() for x in raw_videos.split(",") if x.strip()]
+
+    if not image_names or not video_names:
+        await event.reply("⚠️ No images or videos found to process.")
+        return
+
+    # Check for non-existent items
+    missing_images = [img for img in image_names if img not in image_map]
+    missing_videos = [vid for vid in video_names if vid not in video_map]
+    if missing_images or missing_videos:
+        error_msgs = []
+        if missing_images:
+            error_msgs.append(f"📸 Missing images: {', '.join(missing_images)}")
+        if missing_videos:
+            error_msgs.append(f"🎥 Missing videos: {', '.join(missing_videos)}")
+        await event.reply(f"❌ Cannot proceed:\n" + "\n".join(error_msgs))
+        return
+
     total = len(image_names) * len(video_names)
 
     logger.info(f"🚀 Starting batch processing:")
@@ -1069,8 +1104,6 @@ async def domany(event):
 
     tracking_message = await send_message("group", thread_map["output"], 
                                          f"🎬 Starting batch render: {len(image_names)} images × {len(video_names)} videos = {total} total combinations")
-    image_map = create_map_user_image()
-    video_map = create_map_video()
     current_data = get_data("list_output")
 
     # Callbacks for tracking updates from queue worker
@@ -1181,9 +1214,14 @@ async def domany(event):
         await event.reply(f"✅ Batch queued: {queued} videos will render in background. Bot remains responsive!")
 
 def is_topic_reply(topic, event):
-    if event.reply_to.reply_to_msg_id == entity_map["input_chat_id"]["threads"][topic]:
-        return True
-    return False
+    if not event.reply_to:
+        return False
+    target = entity_map["input_chat_id"]["threads"].get(topic)
+    if target is None:
+        return False
+    reply_to_msg_id = getattr(event.reply_to, 'reply_to_msg_id', None)
+    reply_to_top_id = getattr(event.reply_to, 'reply_to_top_id', None)
+    return reply_to_msg_id == target or reply_to_top_id == target
 
 # ============================================================================
 # EVENT HANDLERS
@@ -1368,7 +1406,7 @@ async def main():
         
         logger.info("👂 Bot is now listening for events...")
         logger.info("🔧 Available commands:")
-        logger.info("   • /domany <images> <videos> - Start batch processing (non-blocking)")
+        logger.info("   • /domany <images|all> <videos|all> - Start batch processing (non-blocking)")
         logger.info("   • /get_chat_id - Get current chat ID")
         logger.info("   • /getres - List available resources")
         logger.info("   • /delete_image <name> - Manually delete image by name")

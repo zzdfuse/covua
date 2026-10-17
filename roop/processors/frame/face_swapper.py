@@ -58,7 +58,6 @@ def get_face_swapper() -> Any:
                     providers.append((p, {
                         'cudnn_conv_algo_search': 'EXHAUSTIVE',
                         'arena_extend_strategy': 'kNextPowerOfTwo',
-                        'do_copy_in_default_stream': True,
                         # Keep GPU arena allocated — avoids malloc/free per frame
                         'gpu_mem_limit': 5 * 1024 * 1024 * 1024,
                         'cudnn_conv_use_max_workspace': '1',
@@ -70,7 +69,8 @@ def get_face_swapper() -> Any:
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
+    with THREAD_LOCK:
+        return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
 
 
 def process_frame(source_face: Face, temp_frame: Frame) -> Frame:

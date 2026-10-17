@@ -105,9 +105,12 @@ def get_temp_frame_paths(target_path: str) -> List[str]:
 
 
 def get_temp_directory_path(target_path: str) -> str:
-    target_name, _ = os.path.splitext(os.path.basename(target_path))
+    if roop.globals.output_path:
+        unique_name, _ = os.path.splitext(os.path.basename(roop.globals.output_path))
+    else:
+        unique_name, _ = os.path.splitext(os.path.basename(target_path))
     target_directory_path = os.path.dirname(target_path)
-    return os.path.join(target_directory_path, TEMP_DIRECTORY, target_name)
+    return os.path.join(target_directory_path, TEMP_DIRECTORY, unique_name)
 
 
 def get_temp_output_path(target_path: str) -> str:
@@ -141,9 +144,12 @@ def clean_temp(target_path: str) -> None:
     temp_directory_path = get_temp_directory_path(target_path)
     parent_directory_path = os.path.dirname(temp_directory_path)
     if not roop.globals.keep_frames and os.path.isdir(temp_directory_path):
-        shutil.rmtree(temp_directory_path)
-    if os.path.exists(parent_directory_path) and not os.listdir(parent_directory_path):
-        os.rmdir(parent_directory_path)
+        shutil.rmtree(temp_directory_path, ignore_errors=True)
+    try:
+        if os.path.exists(parent_directory_path) and not os.listdir(parent_directory_path):
+            os.rmdir(parent_directory_path)
+    except OSError:
+        pass
 
 
 def has_image_extension(image_path: str) -> bool:
