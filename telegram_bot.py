@@ -29,8 +29,13 @@ import logging
 # which starves the GPU by keeping CPU cores busy with scheduling overhead.
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('CUDA_MODULE_LOADING', 'LAZY')   # faster CUDA init
-os.environ.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')     # silence TensorFlow cudart notices
+
+try:
+    from roop.cuda_helper import preload_cuda_libraries
+    preload_cuda_libraries()
+except Exception:
+    pass
 from datetime import datetime
 from asyncio import Queue
 

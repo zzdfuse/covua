@@ -12,12 +12,16 @@ def preload_cuda_libraries():
     to link against them dynamically without failing.
     """
     search_dirs = [
+        '/usr/local/cuda/targets/x86_64-linux/lib',
+        '/usr/local/cuda-13/targets/x86_64-linux/lib',
+        '/usr/local/cuda-13.0/targets/x86_64-linux/lib',
+        '/usr/local/cuda-12/targets/x86_64-linux/lib',
         '/usr/local/cuda/lib64',
         '/usr/local/cuda-13/lib64',
+        '/usr/local/cuda-13.0/lib64',
         '/usr/local/cuda-12/lib64',
         '/usr/local/cuda/lib',
-        '/usr/local/cuda-13/lib',
-        '/usr/local/cuda-12/lib',
+        '/usr/lib64-nvidia',
     ]
 
     # Discover pip-installed nvidia packages in Python site-packages
@@ -43,7 +47,8 @@ def preload_cuda_libraries():
             ld_paths.insert(0, d)
     os.environ['LD_LIBRARY_PATH'] = ':'.join(ld_paths)
 
-    # Preload critical shared objects with RTLD_GLOBAL
+    # Preload all CUDA and cuDNN 9 modules (ops, cnn, adv, engines, etc.)
+    # In cuDNN 9, libcudnn.so dynamically depends on all submodules
     patterns = [
         'libcudart.so*',
         'libcublasLt.so*',
@@ -59,7 +64,7 @@ def preload_cuda_libraries():
         if not os.path.isdir(d):
             continue
         for pat in patterns:
-            for so_file in glob.glob(os.path.join(d, pat)):
+            for so_file in sorted(glob.glob(os.path.join(d, pat))):
                 try:
                     ctypes.CDLL(so_file, mode=ctypes.RTLD_GLOBAL)
                     loaded.append(os.path.basename(so_file))
