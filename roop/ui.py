@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import webbrowser
 try:
@@ -45,7 +46,7 @@ def init(start: Callable[[], None], destroy: Callable[[], None]) -> Any:
     return ROOT
 
 
-def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
+def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> Any:
     global source_label, target_label, status_label
 
     ctk.deactivate_automatic_dpi_awareness()
@@ -106,7 +107,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     return root
 
 
-def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
+def create_preview(parent: Any) -> Any:
     global preview_label, preview_slider
 
     preview = ctk.CTkToplevel(parent)
@@ -179,14 +180,14 @@ def select_output_path(start: Callable[[], None]) -> None:
         start()
 
 
-def render_image_preview(image_path: str, size: Tuple[int, int]) -> ctk.CTkImage:
+def render_image_preview(image_path: str, size: Tuple[int, int]) -> Any:
     image = Image.open(image_path)
     if size:
         image = ImageOps.fit(image, size, Image.LANCZOS)
     return ctk.CTkImage(image, size=image.size)
 
 
-def render_video_preview(video_path: str, size: Tuple[int, int], frame_number: int = 0) -> ctk.CTkImage:
+def render_video_preview(video_path: str, size: Tuple[int, int], frame_number: int = 0) -> Any:
     capture = cv2.VideoCapture(video_path)
     if frame_number:
         capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number)

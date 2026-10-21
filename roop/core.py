@@ -61,7 +61,7 @@ onnxruntime.InferenceSession.__init__ = _safe_ort_session_init
 import roop.globals
 try:
     import roop.ui as ui
-except ImportError:
+except Exception:
     ui = None
 from roop.predicter import predict_image, predict_video
 from roop.processors.frame.core import get_frame_processors_modules
