@@ -12,7 +12,12 @@ from typing import List
 import platform
 import signal
 import shutil
-import argparse
+try:
+    from roop.cuda_helper import preload_cuda_libraries
+    preload_cuda_libraries()
+except Exception:
+    pass
+
 import torch
 import onnxruntime
 try:

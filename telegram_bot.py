@@ -154,32 +154,30 @@ def check_cuda_and_prerequisites(silent=False, force=False):
 
     # 3. ONNX Runtime CUDA (Video Face Swapping / Roop)
     try:
+        try:
+            from roop.cuda_helper import preload_cuda_libraries, inspect_ort_cuda
+            preload_cuda_libraries()
+        except Exception:
+            preload_cuda_libraries = None
+            inspect_ort_cuda = None
+
         import onnxruntime as ort
         providers = ort.get_available_providers()
 
         if 'CUDAExecutionProvider' not in providers:
-            # Check if package collision caused CUDA to be missing
-            import importlib.metadata
-            cpu_inst, gpu_inst = False, False
-            try:
-                importlib.metadata.version('onnxruntime')
-                cpu_inst = True
-            except Exception:
-                pass
-            try:
-                importlib.metadata.version('onnxruntime-gpu')
-                gpu_inst = True
-            except Exception:
-                pass
+            dl_err = ""
+            if inspect_ort_cuda:
+                _, _, dl_err = inspect_ort_cuda()
 
-            if cpu_inst and gpu_inst:
-                results['ort_cuda'] = ('FAIL', 'Collision: onnxruntime & onnxruntime-gpu')
-                r = 'Both CPU onnxruntime and onnxruntime-gpu are installed, causing library collisions and disabling CUDA.'
-                f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
-                issues.append(('ONNX Runtime Package Conflict', r, f))
+            if dl_err:
+                short_dl = os.path.basename(dl_err) if '/' in dl_err else dl_err
+                results['ort_cuda'] = ('FAIL', f'Linker: {short_dl[:35]}')
+                r = f'ONNX Runtime CUDA shared library failed to link: {dl_err}'
+                f = 'Missing CUDA library. Ensure matching CUDA toolkit / cuDNN libraries are present.'
+                issues.append(('ONNX Runtime Dynamic Linker Error', r, f))
             else:
                 results['ort_cuda'] = ('FAIL', f'Only fallback providers: {providers}')
-                r = 'CUDAExecutionProvider is missing from ONNX Runtime.'
+                r = 'CUDAExecutionProvider is not available in ONNX Runtime.'
                 f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
                 issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
         else:
