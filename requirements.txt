@@ -1,6 +1,13 @@
+# Requirements for covua Telegram Bot & Roop
 --extra-index-url https://download.pytorch.org/whl/cu126
---extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
-customtkinter==5.1.3
+
+# Telegram Bot & Google Sheets
+telethon>=1.36.0
+gspread>=6.0.0
+google-auth>=2.0.0
+google-api-python-client>=2.0.0
+
+# Roop Face Swap & Dependencies
 opennsfw2==0.10.2
 numpy>=2.0.2
 gradio>=5.9.1
@@ -16,3 +23,9 @@ tqdm>=4.66.4
 ftfy
 regex
 pyvirtualcam
+
+# Optional SD Inpainting
+diffusers>=0.27.0
+transformers>=4.40.0
+accelerate>=0.30.0
+albumentations>=1.3.0
