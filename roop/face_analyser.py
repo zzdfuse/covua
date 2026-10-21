@@ -16,7 +16,7 @@ def _build_providers():
             providers.append((p, {
                 'cudnn_conv_algo_search': 'DEFAULT',
                 'arena_extend_strategy': 'kNextPowerOfTwo',
-                'gpu_mem_limit': 1 * 1024 * 1024 * 1024,
+                'gpu_mem_limit': 4 * 1024 * 1024 * 1024,
             }))
         else:
             providers.append(p)
@@ -37,7 +37,8 @@ def get_face_analyser() -> Any:
                 allowed_modules=['detection', 'recognition'],
                 providers=providers
             )
-            ctx = 0 if 'CUDAExecutionProvider' in providers else -1
+            is_cuda = any('cuda' in str(p).lower() for p in roop.globals.execution_providers)
+            ctx = 0 if is_cuda else -1
             print(f"[ROOP.CORE] Preparing FaceAnalysis on ctx_id={ctx} (det_size: 320x320)...", flush=True)
             FACE_ANALYSER.prepare(ctx_id=ctx, det_size=(320, 320))
             print(f"[ROOP.CORE] Face analyser ready on ctx_id={ctx}!", flush=True)
