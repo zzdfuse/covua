@@ -11,11 +11,11 @@ from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
 FACE_SWAPPER = None
-THREAD_LOCK = threading.Lock()
+THREAD_LOCK = threading.RLock()
 NAME = 'ROOP.FACE-SWAPPER'
 
 _SOURCE_FACE_CACHE = {}
-_SOURCE_FACE_LOCK = threading.Lock()
+_SOURCE_FACE_LOCK = threading.RLock()
 
 
 def _get_source_face(source_path: str):
@@ -85,8 +85,9 @@ def get_face_swapper() -> Any:
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
+    swapper = get_face_swapper()
     with THREAD_LOCK:
-        return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
+        return swapper.get(temp_frame, target_face, source_face, paste_back=True)
 
 
 def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
