@@ -1,7 +1,10 @@
 import os
 import webbrowser
-import customtkinter as ctk
-from typing import Callable, Tuple
+try:
+    import customtkinter as ctk
+except ImportError:
+    ctk = None
+from typing import Any, Callable, Tuple
 import cv2
 from PIL import Image, ImageOps
 
@@ -32,9 +35,10 @@ target_label = None
 status_label = None
 
 
-def init(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.CTk:
+def init(start: Callable[[], None], destroy: Callable[[], None]) -> Any:
     global ROOT, PREVIEW
-
+    if ctk is None:
+        raise RuntimeError("customtkinter is required for GUI preview. Install it via: pip install customtkinter")
     ROOT = create_root(start, destroy)
     PREVIEW = create_preview(ROOT)
 

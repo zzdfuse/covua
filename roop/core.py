@@ -54,8 +54,10 @@ def _safe_ort_session_init(self, path_or_bytes, *args, **kwargs):
 onnxruntime.InferenceSession.__init__ = _safe_ort_session_init
 
 import roop.globals
-import roop.metadata
-import roop.ui as ui
+try:
+    import roop.ui as ui
+except ImportError:
+    ui = None
 from roop.predicter import predict_image, predict_video
 from roop.processors.frame.core import get_frame_processors_modules
 from roop.utilities import has_image_extension, is_image, is_video, detect_fps, create_video, extract_frames, get_temp_frame_paths, restore_audio, create_temp, move_temp, clean_temp, normalize_output_path
@@ -201,7 +203,7 @@ def pre_check() -> bool:
 
 def update_status(message: str, scope: str = 'ROOP.CORE') -> None:
     print(f'[{scope}] {message}', flush=True)
-    if not roop.globals.headless:
+    if not roop.globals.headless and ui is not None:
         ui.update_status(message)
 
 
@@ -276,5 +278,8 @@ def run() -> None:
     if roop.globals.headless:
         start()
     else:
+        if ui is None:
+            print("Error: GUI mode requires customtkinter. Run: pip install customtkinter", flush=True)
+            return
         window = ui.init(start, destroy)
         window.mainloop()
