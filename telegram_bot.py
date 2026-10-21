@@ -34,9 +34,8 @@ from datetime import datetime
 from asyncio import Queue
 
 from telethon import TelegramClient, events
-from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
-from telethon.tl.functions.channels import CreateChannelRequest
-from telethon.tl.functions.messages import CreateForumTopicRequest
+from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo, DocumentAttributeVideo, DocumentAttributeImageSize
+from telethon.tl.functions.channels import CreateChannelRequest, CreateForumTopicRequest
 from telethon.events import MessageDeleted
 import gspread
 
@@ -64,6 +63,208 @@ def log_separator(title=""):
         logger.info(f"{'='*20} {title} {'='*20}")
     else:
         logger.info("="*50)
+
+# ============================================================================
+# PREREQUISITE & CUDA CAPABILITY CHECK (STEP 1)
+# ============================================================================
+_system_check_cache = None
+
+def check_cuda_and_prerequisites(silent=False, force=False):
+    """
+    Step 1 Pre-flight check:
+    Inspects CUDA readiness for both Video (ONNX Runtime / Roop) and Image (PyTorch / SD inpainting)
+    processing, verifies system drivers, hardware, and external tools, and pinpoints exact reasons
+    for any missing prerequisites.
+    """
+    global _system_check_cache
+    if _system_check_cache is not None and not force:
+        return _system_check_cache
+
+    import subprocess
+    import shutil
+    import platform
+
+    results = {}
+    issues = []
+
+    # 1. System & NVIDIA Driver (Hardware layer)
+    smi_path = shutil.which('nvidia-smi')
+    if smi_path:
+        try:
+            res = subprocess.run(
+                ['nvidia-smi', '--query-gpu=name,driver_version,memory.total', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=5
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                gpu_lines = [line.strip() for line in res.stdout.strip().split('\n') if line.strip()]
+                results['nvidia_gpu'] = ('OK', '; '.join(gpu_lines))
+            else:
+                err_msg = res.stderr.strip()[:60] if res.stderr else "empty response"
+                results['nvidia_gpu'] = ('WARN', f'nvidia-smi error: {err_msg}')
+                issues.append(('NVIDIA Driver', 'nvidia-smi returned an error.', 'Verify NVIDIA driver status.'))
+        except Exception as e:
+            results['nvidia_gpu'] = ('WARN', f'Failed to query nvidia-smi: {e}')
+            issues.append(('NVIDIA Driver', str(e), 'Verify nvidia-smi command.'))
+    else:
+        plat = platform.system()
+        if plat == 'Darwin':
+            reason = 'Running on macOS. Apple hardware does not support NVIDIA CUDA.'
+            fix = 'To use CUDA acceleration, run on Linux or Google Colab with an NVIDIA GPU runtime.'
+        else:
+            reason = 'nvidia-smi not found in PATH. NVIDIA driver is not installed or no NVIDIA GPU is present.'
+            fix = 'If on Google Colab, enable GPU runtime (Runtime > Change runtime type > T4 GPU). If on Linux, install NVIDIA driver (e.g. sudo apt install -y nvidia-driver-535).'
+        results['nvidia_gpu'] = ('FAIL', 'No NVIDIA GPU / driver detected')
+        issues.append(('NVIDIA Driver & Hardware', reason, fix))
+
+    # 2. PyTorch CUDA (Image Inpainting / Cloth Removal / Face Analysis)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            dev_name = torch.cuda.get_device_name(0)
+            mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            cuda_ver = torch.version.cuda or 'Unknown'
+            cudnn_ver = torch.backends.cudnn.version() or 'Unknown'
+            results['torch_cuda'] = ('OK', f'CUDA {cuda_ver}, cuDNN {cudnn_ver}, {dev_name} ({mem_gb:.1f} GB)')
+        else:
+            results['torch_cuda'] = ('FAIL', f'PyTorch {torch.__version__} (CUDA unavailable)')
+            if torch.version.cuda is None:
+                r = 'PyTorch was installed as a CPU-only build (torch.version.cuda is None).'
+                f = 'Reinstall PyTorch with CUDA: pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu118'
+            elif torch.cuda.device_count() == 0:
+                r = f'PyTorch has CUDA build ({torch.version.cuda}), but detected 0 GPUs.'
+                f = 'Verify NVIDIA driver is loaded and CUDA_VISIBLE_DEVICES is not hiding GPUs.'
+            else:
+                r = 'PyTorch CUDA initialization failed.'
+                f = 'Check NVIDIA driver compatibility with the installed CUDA runtime.'
+            issues.append(('PyTorch CUDA (Image Inpainting / SD)', r, f))
+    except Exception as e:
+        results['torch_cuda'] = ('FAIL', f'torch error: {str(e)[:35]}')
+        issues.append(('PyTorch', f'Error loading torch: {e}', 'Install torch: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118'))
+
+    # 3. ONNX Runtime CUDA (Video Face Swapping / Roop)
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        if 'CUDAExecutionProvider' in providers:
+            results['ort_cuda'] = ('OK', f'CUDAExecutionProvider available (Providers: {len(providers)})')
+        else:
+            results['ort_cuda'] = ('FAIL', f'Only fallback providers: {providers}')
+            r = 'CUDAExecutionProvider is missing from ONNX Runtime.'
+            f = 'Standard CPU onnxruntime is installed instead of onnxruntime-gpu. Fix: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
+            issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
+    except Exception as e:
+        err_msg = str(e)
+        results['ort_cuda'] = ('FAIL', f'onnxruntime error: {err_msg[:35]}')
+        if 'numpy' in err_msg.lower() or 'multiarray' in err_msg.lower():
+            r = f'onnxruntime failed due to NumPy version incompatibility: {err_msg}'
+            f = "Downgrade NumPy: pip install 'numpy<2.0.0'"
+        else:
+            r = f'onnxruntime package error: {err_msg}'
+            f = 'Reinstall onnxruntime-gpu: pip install onnxruntime-gpu'
+        issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
+
+    # 4. FFmpeg Binary (Video decoding, encoding, audio remuxing)
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        results['ffmpeg'] = ('OK', ffmpeg_path)
+    else:
+        results['ffmpeg'] = ('FAIL', 'ffmpeg not found in PATH')
+        issues.append(('FFmpeg', 'ffmpeg executable is missing.', 'Install: apt-get install -y ffmpeg (Linux) or brew install ffmpeg (macOS)'))
+
+    # 5. Roop Face Swap Model (inswapper_128.onnx)
+    model_candidates = [
+        os.path.join(SCRIPT_DIR, 'roop', 'models', 'inswapper_128.onnx'),
+        os.path.join(SCRIPT_DIR, 'models', 'inswapper_128.onnx'),
+        os.path.expanduser('~/.roop/inswapper_128.onnx'),
+        '/content/inswapper_128.onnx'
+    ]
+    found_model = None
+    for p in model_candidates:
+        if os.path.exists(p):
+            sz = os.path.getsize(p) / (1024 * 1024)
+            found_model = f'{os.path.basename(p)} ({sz:.1f} MB)'
+            break
+    if found_model:
+        results['roop_model'] = ('OK', found_model)
+    else:
+        results['roop_model'] = ('INFO', 'Not cached yet (will auto-download on first render)')
+
+    video_cuda = results.get('ort_cuda', ('FAIL', ''))[0] == 'OK'
+    image_cuda = results.get('torch_cuda', ('FAIL', ''))[0] == 'OK'
+    ffmpeg_ok = results.get('ffmpeg', ('FAIL', ''))[0] == 'OK'
+
+    # Build display banner
+    banner = []
+    banner.append("=" * 82)
+    banner.append("🔍 STEP 1: HARDWARE & CUDA ACCELERATION PREREQUISITE CHECK")
+    banner.append("=" * 82)
+    fmt = "| %-26s | %-6s | %-42s |"
+    banner.append(fmt % ('Component', 'Status', 'Diagnostic Details'))
+    banner.append("+" + "-" * 28 + "+" + "-" * 8 + "+" + "-" * 44 + "+")
+
+    status_icon = {'OK': '✅ OK', 'FAIL': '❌ FAIL', 'WARN': '⚠️ WARN', 'INFO': 'ℹ️ INFO'}
+    labels = {
+        'nvidia_gpu': 'NVIDIA Driver & Hardware',
+        'torch_cuda': 'PyTorch CUDA (Image/SD)',
+        'ort_cuda': 'ONNX Runtime (Video/Roop)',
+        'ffmpeg': 'FFmpeg Binary',
+        'roop_model': 'Roop Face Swap Model',
+    }
+
+    for key, label in labels.items():
+        st, det = results.get(key, ('UNKNOWN', ''))
+        icon = status_icon.get(st, st)
+        det_disp = det if len(det) <= 42 else det[:39] + '...'
+        banner.append(fmt % (label, icon, det_disp))
+    banner.append("+" + "-" * 28 + "+" + "-" * 8 + "+" + "-" * 44 + "+")
+
+    banner.append("\n📊 ACCELERATION READINESS:")
+    if video_cuda and ffmpeg_ok:
+        v_msg = "✅ CUDA ACCELERATED (Full GPU Support)"
+    elif ffmpeg_ok:
+        v_msg = "⚠️ CPU FALLBACK (SLOW - ONNX Runtime has no CUDA; rendering will run on CPU)"
+    else:
+        v_msg = "❌ UNAVAILABLE (Missing FFmpeg or ONNX Runtime)"
+
+    if image_cuda:
+        i_msg = "✅ CUDA ACCELERATED (Full GPU Support)"
+    else:
+        i_msg = "❌ UNAVAILABLE (SD inpainting strictly requires CUDA)"
+
+    banner.append(f"   🎥 Video Face Swap (Roop):  {v_msg}")
+    banner.append(f"   🖼️ Image Inpaint (SD):      {i_msg}")
+
+    if issues:
+        banner.append("\n⚠️ PREREQUISITE ISSUES & ACTIONABLE FIXES:")
+        for idx, (comp, reason, fix) in enumerate(issues, 1):
+            banner.append(f"   [{idx}] {comp}:")
+            banner.append(f"       • Reason: {reason}")
+            banner.append(f"       • Fix:    {fix}")
+    else:
+        banner.append("\n🎉 All prerequisites met! System is fully optimized for GPU rendering.")
+    banner.append("=" * 82)
+
+    output_str = "\n".join(banner)
+    if not silent:
+        print(output_str)
+        for line in banner:
+            logger.info(line)
+
+    _system_check_cache = {
+        'video_cuda': video_cuda,
+        'image_cuda': image_cuda,
+        'ffmpeg_ok': ffmpeg_ok,
+        'results': results,
+        'issues': issues,
+        'banner_str': output_str
+    }
+    return _system_check_cache
+
+# Run prerequisite & CUDA check as the very first step when starting python telegram_bot.py
+if __name__ == "__main__":
+    check_cuda_and_prerequisites()
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("--check", "--check-cuda", "-c", "--prereq"):
+        sys.exit(0)
 
 # ============================================================================
 # SD INPAINTING CONFIGURATION (etcd thread — cloth removal)
@@ -224,13 +425,55 @@ def check_image_by_message_id(message_id, data=None):
             return True, i, data[i][1], data[i][2], data[i][3], channel_id, old_name
     return False, None, None, None, None, None, None
 
+def is_video_message(message):
+    if not message:
+        return False
+    if getattr(message, 'video', None):
+        return True
+    doc = getattr(message, 'document', None)
+    if doc:
+        mime = getattr(doc, 'mime_type', '') or ''
+        if mime.startswith('video/'):
+            return True
+        for attr in getattr(doc, 'attributes', []) or []:
+            if isinstance(attr, DocumentAttributeVideo):
+                return True
+    return False
+
+def is_photo_message(message):
+    if not message:
+        return False
+    if getattr(message, 'photo', None):
+        return True
+    doc = getattr(message, 'document', None)
+    if doc:
+        mime = getattr(doc, 'mime_type', '') or ''
+        if mime.startswith('image/'):
+            return True
+        for attr in getattr(doc, 'attributes', []) or []:
+            if isinstance(attr, DocumentAttributeImageSize):
+                return True
+    return False
+
+def sanitize_video_name(text):
+    if not text:
+        return ""
+    first_line = text.strip().split("\n")[0].strip()
+    words = [w for w in first_line.split() if not w.startswith("http://") and not w.startswith("https://") and not w.startswith("@")]
+    clean = " ".join(words).strip().lower()
+    clean = clean.strip(".,;:!?_-\"'/\\")
+    if len(clean) > 40:
+        clean = clean[:40].strip()
+    return clean
+
 def check_video_exist(video_id, data=None):
     if data is None:
         data = get_data("list_video")
-    for i in data:
-        if i[0] == video_id:
-            return True, i[1]
-    return False, None
+    for idx, row in enumerate(data):
+        if str(row[0]) == str(video_id):
+            name = row[1] if len(row) > 1 else ""
+            return True, name, idx + 2
+    return False, None, None
 
 def get_topic_id(image_id, data=None):
     if data is None:
@@ -398,12 +641,22 @@ async def render_video(input_image, input_video, output_path):
     if not os.path.exists(run_py):
         run_py = os.path.join(ROOP_PATH, 'run.py')
 
+    # Check execution provider: prefer cuda if available, fallback to cpu
+    exec_provider = 'cuda'
+    try:
+        import onnxruntime as ort
+        if 'CUDAExecutionProvider' not in ort.get_available_providers():
+            exec_provider = 'cpu'
+            logger.warning("⚠️ CUDAExecutionProvider not available in ONNX Runtime; falling back to CPU for Roop rendering")
+    except Exception:
+        exec_provider = 'cpu'
+
     cmd = [
         sys.executable, run_py,
         '-s', input_image,
         '-t', input_video,
         '-o', output_path,
-        '--execution-provider', 'cuda',
+        '--execution-provider', exec_provider,
         '--execution-threads', str(cfg.get('execution_threads', 4)),
         '--max-memory', str(cfg.get('max_memory', 6)),
         '--video-encoder', cfg.get('video_encoder', 'libx264'),
@@ -783,6 +1036,11 @@ def _ensure_sd_loaded():
         return
     logger.info("📦 Loading SD inpainting models...")
     import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available for PyTorch. Stable Diffusion cloth removal requires a CUDA-capable GPU. "
+            "Please start on an environment with an NVIDIA GPU runtime (e.g. Google Colab with GPU enabled)."
+        )
     import albumentations as albu
     from diffusers import StableDiffusionInpaintPipeline
     from cloths_segmentation.pre_trained_models import create_model
@@ -898,13 +1156,15 @@ async def handle_etcd_image(event):
 # MESSAGE HANDLERS
 # ============================================================================
 async def handle_image_no_text(event):
-    reply_message = await event.reply("Please update the caption for the image")
-    sleep(2)
-    await reply_message.delete()
+    await event.reply(
+        f"🖼️ **Photo received** (ID: `{event.message.id}`)\n"
+        f"💬 Reply to this photo with a name (e.g. `alex`) to register it!"
+    )
 
-async def handle_image_has_text(event):
-    message_id = event.message.id
-    message_text = event.message.text.lower()
+async def handle_image_has_text(event, custom_message=None, custom_name=None):
+    target_msg = custom_message or event.message
+    message_id = target_msg.id
+    message_text = (custom_name or target_msg.text or "").lower().strip()
     logger.info(f"🖼️ Processing image with text: '{message_text}' (ID: {message_id})")
 
     # First check if this message_id already exists (this is an edit, not a new message)
@@ -915,7 +1175,7 @@ async def handle_image_has_text(event):
         
         # Update the channel name and photo if channel_id exists
         if channel_id:
-            update_success = await update_channel_info(channel_id, message_text, event.message, old_text)
+            update_success = await update_channel_info(channel_id, message_text, target_msg, old_text)
             if update_success:
                 # Update the sheet with new name
                 # Column B (index 1) = message_text
@@ -934,7 +1194,7 @@ async def handle_image_has_text(event):
         else:
             # Old record without channel - create one now
             logger.info(f"🆕 No channel exists for message {message_id}, creating new channel: {message_text}")
-            new_channel_id = await create_separate_chat(message_text, event.message)
+            new_channel_id = await create_separate_chat(message_text, target_msg)
             
             if new_channel_id:
                 # Update the sheet with new channel_id in column F (index 5)
@@ -970,7 +1230,7 @@ async def handle_image_has_text(event):
     
     # Run both operations in parallel using asyncio.gather
     topic_task = create_forum_topic(message_text, get_entity_id("output_chat_id"))
-    channel_task = create_separate_chat(message_text, event.message)  # Pass the message with photo
+    channel_task = create_separate_chat(message_text, target_msg)  # Pass the message with photo
     
     # Wait for both to complete
     topic_id, channel_id = await asyncio.gather(topic_task, channel_task)
@@ -998,29 +1258,59 @@ async def handle_image_has_text(event):
 
     logger.info(f"✅ Completed handling image with text: {message_text}")
 
+async def register_or_update_video(message_id, video_name, event):
+    message_id = str(message_id)
+    video_name = video_name.strip().lower()
+
+    if not video_name:
+        await event.reply("⚠️ Video name cannot be empty.")
+        return False
+
+    exists, old_name, row_num = check_video_exist(message_id)
+    if exists:
+        if old_name == video_name:
+            reply_msg = await event.reply(f"ℹ️ Video already registered with name '{video_name}' (ID: {message_id})")
+            sleep(3)
+            await reply_msg.delete()
+            return True
+        try:
+            sh.worksheet("list_video").update_acell(f"B{row_num}", video_name)
+            logger.info(f"✏️ Updated video name for ID {message_id}: '{old_name}' → '{video_name}'")
+            reply_msg = await event.reply(f"✏️ Video (ID: {message_id}) renamed from '{old_name}' to '{video_name}'")
+            sleep(3)
+            await reply_msg.delete()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to rename video {message_id}: {e}")
+            await event.reply(f"❌ Error updating video name: {e}")
+            return False
+    else:
+        try:
+            sh.worksheet("list_video").append_row([message_id, video_name])
+            logger.info(f"✅ Video '{video_name}' (ID: {message_id}) added successfully")
+            reply_msg = await event.reply(f"✅ Video '{video_name}' added successfully (ID: {message_id})")
+            sleep(3)
+            await reply_msg.delete()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to add video {message_id}: {e}")
+            await event.reply(f"❌ Error adding video: {e}")
+            return False
+
 async def handle_input_video_no_text(event):
-    reply_message = await event.reply("Please update the caption for the video")
-    sleep(2)
-    await reply_message.delete()
+    await event.reply(
+        f"📹 **Video received** (ID: `{event.message.id}`)\n"
+        f"💬 Reply to this video with a name (e.g. `dance1`) to save it!"
+    )
 
 async def handle_input_video_has_text(event):
     message_id = event.message.id
-    message_text = event.message.text.lower()
-    logger.info(f"🎥 Processing video with text: '{message_text}' (ID: {message_id})")
-
-    video_exist = check_video_exist(message_id)
-    if video_exist[0]:
-        logger.info(f"⚠️ Video already exists: {video_exist[1]}")
-        reply_message = await event.reply(f"Video already exist with name {video_exist[1]}")
-        sleep(2)
-        await reply_message.delete()
-        return
-
-    sh.worksheet("list_video").append_row([message_id, message_text])
-    logger.info(f"✅ Video '{message_text}' added successfully")
-    reply_message = await event.reply(f"Video {message_text} is added")
-    sleep(2)
-    await reply_message.delete()
+    raw_text = (event.message.text or "").strip()
+    clean_name = sanitize_video_name(raw_text)
+    if clean_name:
+        await register_or_update_video(message_id, clean_name, event)
+    else:
+        await handle_input_video_no_text(event)
 
 async def handle_message_deleted(event):
     """Handle when messages are deleted from input_chat_id"""
@@ -1231,39 +1521,127 @@ async def new_photo_handler(event):
     logger.info(f"📨 New message received from user {get_entity_id('user_id')}")
 
     if is_topic_reply("faces", event):
-        if not event.photo:
-            logger.info("❌ Message in faces topic but no photo found")
+        if is_photo_message(event.message):
+            logger.info("🖼️ Processing photo in faces topic")
+            if event.message.text:
+                await handle_image_has_text(event)
+            else:
+                await handle_image_no_text(event)
             return
-        logger.info("🖼️ Processing photo in faces topic")
-        if event.message.text:
-            await handle_image_has_text(event)
-        else:
-            await handle_image_no_text(event)
+
+        elif event.message.text:
+            text = event.message.text.strip()
+            if text.startswith("/"):
+                return
+            logger.info(f"💬 Received text in faces topic: '{text}' (resolving target photo)")
+            target_photo = None
+
+            if event.reply_to and event.reply_to.reply_to_msg_id:
+                reply_id = event.reply_to.reply_to_msg_id
+                topic_root = entity_map["input_chat_id"]["threads"]["faces"]
+                if reply_id != topic_root:
+                    target_msg = await client.get_messages(get_entity_id("input_chat_id"), ids=reply_id)
+                    if is_photo_message(target_msg):
+                        target_photo = target_msg
+                    elif target_msg and target_msg.reply_to and target_msg.reply_to.reply_to_msg_id:
+                        parent_msg = await client.get_messages(get_entity_id("input_chat_id"), ids=target_msg.reply_to.reply_to_msg_id)
+                        if is_photo_message(parent_msg):
+                            target_photo = parent_msg
+
+            if not target_photo:
+                recent_msgs = await client.get_messages(
+                    get_entity_id("input_chat_id"),
+                    limit=10,
+                    reply_to=entity_map["input_chat_id"]["threads"]["faces"]
+                )
+                for m in recent_msgs:
+                    if m.id != event.message.id and is_photo_message(m):
+                        exists, _, _, _, _, _, _ = check_image_by_message_id(m.id)
+                        if not exists:
+                            target_photo = m
+                            logger.info(f"🎯 Matched text '{text}' to recent unnamed photo ID {m.id}")
+                            break
+
+            if target_photo:
+                await handle_image_has_text(event, custom_message=target_photo, custom_name=text.lower())
+                return
+            else:
+                logger.info("❌ Message in faces topic but no photo found")
+                return
 
     if is_topic_reply("vid", event):
-        if not event.video:
-            logger.info("❌ Message in vid topic but no video found")
+        if is_video_message(event.message):
+            logger.info(f"🎥 Processing video in vid topic (ID: {event.message.id})")
+            if event.message.text:
+                await handle_input_video_has_text(event)
+            else:
+                await handle_input_video_no_text(event)
             return
-        logger.info("🎥 Processing video in vid topic")
-        if event.message.text:
-            await handle_input_video_has_text(event)
+
+        elif event.message.text:
+            text = event.message.text.strip()
+            if text.startswith("/"):
+                return
+            logger.info(f"💬 Received text in vid topic: '{text}' (resolving target video)")
+            target_video_id = None
+
+            # 1. Check direct reply
+            if event.reply_to and event.reply_to.reply_to_msg_id:
+                reply_id = event.reply_to.reply_to_msg_id
+                topic_root = entity_map["input_chat_id"]["threads"]["vid"]
+                if reply_id != topic_root:
+                    target_msg = await client.get_messages(get_entity_id("input_chat_id"), ids=reply_id)
+                    if is_video_message(target_msg):
+                        target_video_id = target_msg.id
+                    elif target_msg and target_msg.reply_to and target_msg.reply_to.reply_to_msg_id:
+                        parent_msg = await client.get_messages(get_entity_id("input_chat_id"), ids=target_msg.reply_to.reply_to_msg_id)
+                        if is_video_message(parent_msg):
+                            target_video_id = parent_msg.id
+
+            # 2. Check recent unnamed video
+            if not target_video_id:
+                recent_msgs = await client.get_messages(
+                    get_entity_id("input_chat_id"),
+                    limit=10,
+                    reply_to=entity_map["input_chat_id"]["threads"]["vid"]
+                )
+                for m in recent_msgs:
+                    if m.id != event.message.id and is_video_message(m):
+                        exists, _, _ = check_video_exist(m.id)
+                        if not exists:
+                            target_video_id = m.id
+                            logger.info(f"🎯 Matched text '{text}' to recent unnamed video ID {target_video_id}")
+                            break
+
+            if target_video_id:
+                clean_name = sanitize_video_name(text)
+                await register_or_update_video(target_video_id, clean_name, event)
+                return
+            else:
+                logger.info(f"ℹ️ Text in vid topic not linked to any video: '{text}'")
+                await event.reply("⚠️ Please reply directly to a video message with the name you want to give it.")
+                return
+
         else:
-            await handle_input_video_no_text(event)
+            logger.info("❌ Message in vid topic but no video or text found")
+            return
 
 @client.on(events.MessageEdited(chats=get_entity_id("input_chat_id"), from_users=get_entity_id("user_id")))
 async def message_edited_handler(event):
     logger.info(f"✏️ Message edited by user {get_entity_id('user_id')}")
 
     if is_topic_reply("faces", event):
-        if event.photo and event.message.text:
+        if is_photo_message(event.message) and event.message.text:
             logger.info("🖼️ Processing edited photo with text in faces topic")
             await handle_image_has_text(event)
         return
 
     if is_topic_reply("vid", event):
-        if event.video and event.message.text:
+        if is_video_message(event.message) and event.message.text:
             logger.info("🎥 Processing edited video with text in vid topic")
-            await handle_input_video_has_text(event)
+            clean_name = sanitize_video_name(event.message.text)
+            if clean_name:
+                await register_or_update_video(event.message.id, clean_name, event)
         return
 
 @client.on(events.NewMessage(chats=get_entity_id("group"), from_users=get_entity_id("user_id"), pattern='/domany .*'))
@@ -1375,12 +1753,40 @@ async def etcd_image_handler(event):
     logger.info(f"🖼️ Photo received in group etcd thread — starting inpainting (msg {event.message.id})")
     await handle_etcd_image(event)
 
+@client.on(events.NewMessage(chats=get_entity_id("group"), pattern='/check_cuda'))
+async def check_cuda_command(event):
+    """Handle /check_cuda command to report hardware and acceleration status to Telegram"""
+    logger.info("🔍 /check_cuda command received")
+    status = check_cuda_and_prerequisites(silent=True)
+    res = status['results']
+    v_st = "✅ CUDA Accelerated" if status['video_cuda'] else "⚠️ CPU Fallback (Slow)"
+    i_st = "✅ CUDA Accelerated" if status['image_cuda'] else "❌ CUDA Unavailable"
+    
+    msg = (
+        f"🖥️ **System & Acceleration Status:**\n\n"
+        f"• **NVIDIA GPU:** `{res.get('nvidia_gpu', ('?', '?'))[1]}`\n"
+        f"• **PyTorch CUDA:** `{res.get('torch_cuda', ('?', '?'))[1]}`\n"
+        f"• **ONNX Runtime:** `{res.get('ort_cuda', ('?', '?'))[1]}`\n"
+        f"• **FFmpeg:** `{res.get('ffmpeg', ('?', '?'))[1]}`\n\n"
+        f"📊 **Readiness:**\n"
+        f"• 🎥 Video Face Swap: {v_st}\n"
+        f"• 🖼️ Image Inpainting: {i_st}\n"
+    )
+    if status['issues']:
+        msg += "\n⚠️ **Issues Detected:**\n"
+        for idx, (comp, reason, fix) in enumerate(status['issues'], 1):
+            msg += f"{idx}. **{comp}**: {reason}\n   👉 _Fix_: `{fix}`\n"
+    await event.reply(msg)
+
 # ============================================================================
 # MAIN FUNCTION
 # ============================================================================
 async def main():
     """Main function to run the Telegram bot"""
     global render_worker_tasks
+
+    # Step 1: Pre-flight Hardware & CUDA Prerequisite Check
+    check_cuda_and_prerequisites()
 
     log_separator("STARTING TELEGRAM CLIENT")
     logger.info("🚀 Starting Telegram clients...")
@@ -1409,6 +1815,7 @@ async def main():
         logger.info("   • /domany <images|all> <videos|all> - Start batch processing (non-blocking)")
         logger.info("   • /get_chat_id - Get current chat ID")
         logger.info("   • /getres - List available resources")
+        logger.info("   • /check_cuda - Check GPU & CUDA acceleration status")
         logger.info("   • /delete_image <name> - Manually delete image by name")
         logger.info("   • /delete_video <name> - Manually delete video by name")
         logger.info("🔥 SD inpainting: upload a photo to group etcd thread (375) to trigger cloth removal")
@@ -1438,4 +1845,7 @@ async def main():
             print("Stopped")
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("--check", "--check-cuda", "-c", "--prereq"):
+        check_cuda_and_prerequisites()
+        sys.exit(0)
     asyncio.run(main())
