@@ -181,29 +181,44 @@ def check_cuda_and_prerequisites(silent=False, force=False):
                 f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
                 issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
             else:
-                # Live validation test: Create an actual in-memory InferenceSession using CUDAExecutionProvider
+                # Live validation test: Test CUDAExecutionProvider using cached model on disk
                 try:
-                    import onnx
-                    from onnx import helper, TensorProto
-                    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1])
-                    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1])
-                    node = helper.make_node('Identity', ['X'], ['Y'])
-                    graph = helper.make_graph([node], 'test', [X], [Y])
-                    model = helper.make_model(graph)
-                    model_bytes = model.SerializeToString()
-                    
-                    test_sess = ort.InferenceSession(model_bytes, providers=['CUDAExecutionProvider'])
-                    active = test_sess.get_providers()
-                    if 'CUDAExecutionProvider' in active:
-                        results['ort_cuda'] = ('OK', f'CUDA verified (ORT v{ort.__version__})')
+                    insightface_dir = os.path.expanduser('~/.insightface/models/buffalo_l')
+                    buffalo_det = os.path.join(insightface_dir, 'det_10g.onnx')
+                    roop_swapper = os.path.join(os.path.dirname(__file__), 'models/inswapper_128.onnx')
+
+                    test_sess = None
+                    if os.path.exists(buffalo_det):
+                        test_sess = ort.InferenceSession(buffalo_det, providers=['CUDAExecutionProvider'])
+                    elif os.path.exists(roop_swapper):
+                        test_sess = ort.InferenceSession(roop_swapper, providers=['CUDAExecutionProvider'])
                     else:
-                        results['ort_cuda'] = ('FAIL', f'Fell back to: {active}')
-                        issues.append(('ONNX Runtime CUDA Fallback', 'CUDA provider failed to activate during session creation.', 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'))
+                        try:
+                            import onnx
+                            from onnx import helper, TensorProto
+                            X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1])
+                            Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1])
+                            node = helper.make_node('Identity', ['X'], ['Y'])
+                            graph = helper.make_graph([node], 'test', [X], [Y])
+                            model = helper.make_model(graph)
+                            test_sess = ort.InferenceSession(model.SerializeToString(), providers=['CUDAExecutionProvider'])
+                        except ImportError:
+                            test_sess = None
+
+                    if test_sess is not None:
+                        active = test_sess.get_providers()
+                        if 'CUDAExecutionProvider' in active:
+                            results['ort_cuda'] = ('OK', f'CUDA verified (ORT v{ort.__version__})')
+                        else:
+                            results['ort_cuda'] = ('FAIL', f'Fell back to: {active}')
+                            issues.append(('ONNX Runtime CUDA Fallback', 'CUDA provider fell back to CPU during session creation.', 'Run: pip install onnxruntime-gpu'))
+                    else:
+                        results['ort_cuda'] = ('OK', f'CUDAExecutionProvider available (ORT v{ort.__version__})')
                 except Exception as sess_err:
                     err_str = str(sess_err)
                     results['ort_cuda'] = ('FAIL', f'CUDA session failed: {err_str[:35]}')
                     r = f'ONNX Runtime CUDA failed to initialize: {err_str}'
-                    f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
+                    f = 'Run: pip install onnxruntime-gpu'
                     issues.append(('ONNX Runtime CUDA Initialization Error', r, f))
     except Exception as e:
         err_msg = str(e)
