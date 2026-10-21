@@ -164,7 +164,7 @@ def pre_check() -> bool:
 
 
 def update_status(message: str, scope: str = 'ROOP.CORE') -> None:
-    print(f'[{scope}] {message}')
+    print(f'[{scope}] {message}', flush=True)
     if not roop.globals.headless:
         ui.update_status(message)
 

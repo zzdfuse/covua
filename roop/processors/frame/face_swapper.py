@@ -35,7 +35,8 @@ def pre_start() -> bool:
     if not is_image(roop.globals.source_path):
         update_status('Select an image for source path.', NAME)
         return False
-    elif not get_one_face(cv2.imread(roop.globals.source_path)):
+    update_status('Detecting face in source image...', NAME)
+    if not get_one_face(cv2.imread(roop.globals.source_path)):
         update_status('No face in source path detected.', NAME)
         return False
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
@@ -56,7 +57,7 @@ def get_face_swapper() -> Any:
             for p in roop.globals.execution_providers:
                 if p == 'CUDAExecutionProvider':
                     providers.append((p, {
-                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'cudnn_conv_algo_search': 'HEURISTIC',
                         'arena_extend_strategy': 'kNextPowerOfTwo',
                         # Keep GPU arena allocated — avoids malloc/free per frame
                         'gpu_mem_limit': 3 * 1024 * 1024 * 1024,

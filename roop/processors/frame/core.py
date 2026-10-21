@@ -54,6 +54,18 @@ def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_f
 def process_video(source_path: str, frame_paths: list[str], process_frames: Callable[[str, List[str], Any], None]) -> None:
     progress_bar_format = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
     total = len(frame_paths)
+    step = max(1, total // 10)
     with tqdm(total=total, desc='Processing', unit='frame', dynamic_ncols=True, bar_format=progress_bar_format) as progress:
         progress.set_postfix({'execution_providers': roop.globals.execution_providers, 'threads': roop.globals.execution_threads, 'memory': roop.globals.max_memory})
+        
+        orig_update = progress.update
+        last_logged = [0]
+        def update_with_log(n=1):
+            orig_update(n)
+            if progress.n - last_logged[0] >= step or progress.n >= total:
+                pct = (progress.n / total) * 100 if total else 100
+                print(f"[ROOP.CORE] Progress: {progress.n}/{total} frames ({pct:.1f}%)", flush=True)
+                last_logged[0] = progress.n
+        progress.update = update_with_log
+
         multi_process_frame(source_path, frame_paths, process_frames, progress)
