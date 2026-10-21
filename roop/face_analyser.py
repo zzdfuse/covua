@@ -14,11 +14,14 @@ def _build_providers():
     for p in roop.globals.execution_providers:
         if p == 'CUDAExecutionProvider':
             providers.append((p, {
+                'cudnn_conv_algo_search': 'DEFAULT',
                 'arena_extend_strategy': 'kNextPowerOfTwo',
                 'gpu_mem_limit': 1 * 1024 * 1024 * 1024,
             }))
         else:
             providers.append(p)
+    if 'CUDAExecutionProvider' in roop.globals.execution_providers and 'CPUExecutionProvider' not in providers:
+        providers.append('CPUExecutionProvider')
     return providers
 
 
@@ -27,9 +30,7 @@ def get_face_analyser() -> Any:
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            providers = list(roop.globals.execution_providers)
-            if 'CUDAExecutionProvider' in providers and 'CPUExecutionProvider' not in providers:
-                providers.append('CPUExecutionProvider')
+            providers = _build_providers()
             print(f"[ROOP.CORE] Loading FaceAnalysis (buffalo_l: detection + recognition)...", flush=True)
             FACE_ANALYSER = insightface.app.FaceAnalysis(
                 name='buffalo_l',

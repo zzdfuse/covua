@@ -38,12 +38,12 @@ def _safe_ort_session_init(self, path_or_bytes, *args, **kwargs):
         for p in providers:
             if isinstance(p, tuple) and p[0] == 'CUDAExecutionProvider':
                 opts = dict(p[1]) if len(p) > 1 and isinstance(p[1], dict) else {}
-                opts.setdefault('cudnn_conv_algo_search', 'HEURISTIC')
+                opts['cudnn_conv_algo_search'] = 'DEFAULT'
                 opts.setdefault('arena_extend_strategy', 'kNextPowerOfTwo')
                 new_providers.append((p[0], opts))
             elif p == 'CUDAExecutionProvider':
                 new_providers.append(('CUDAExecutionProvider', {
-                    'cudnn_conv_algo_search': 'HEURISTIC',
+                    'cudnn_conv_algo_search': 'DEFAULT',
                     'arena_extend_strategy': 'kNextPowerOfTwo',
                 }))
             else:

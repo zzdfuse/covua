@@ -58,7 +58,7 @@ def get_face_swapper() -> Any:
             for p in roop.globals.execution_providers:
                 if p == 'CUDAExecutionProvider':
                     providers.append((p, {
-                        'cudnn_conv_algo_search': 'HEURISTIC',
+                        'cudnn_conv_algo_search': 'DEFAULT',
                         'arena_extend_strategy': 'kNextPowerOfTwo',
                         # Keep GPU arena allocated — avoids malloc/free per frame
                         'gpu_mem_limit': 3 * 1024 * 1024 * 1024,
