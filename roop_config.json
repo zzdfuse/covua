@@ -9,6 +9,6 @@
   "max_memory": 6,
   "execution_providers": ["CUDAExecutionProvider"],
   "execution_threads": 4,
-  "concurrent_renders": 2,
+  "concurrent_renders": 1,
   "headless": true
 }

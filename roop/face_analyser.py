@@ -27,24 +27,30 @@ def get_face_analyser() -> Any:
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            # Clean string providers for robust InsightFace compatibility
             providers = list(roop.globals.execution_providers)
             if 'CUDAExecutionProvider' in providers and 'CPUExecutionProvider' not in providers:
                 providers.append('CPUExecutionProvider')
-            FACE_ANALYSER = insightface.app.FaceAnalysis(name='buffalo_l', providers=providers)
-            # 320x320 is ~4x faster than 640x640 with negligible quality loss for typical video frames.
+            print(f"[ROOP.CORE] Loading FaceAnalysis (buffalo_l: detection + recognition)...", flush=True)
+            FACE_ANALYSER = insightface.app.FaceAnalysis(
+                name='buffalo_l',
+                allowed_modules=['detection', 'recognition'],
+                providers=providers
+            )
             ctx = 0 if 'CUDAExecutionProvider' in providers else -1
+            print(f"[ROOP.CORE] Preparing FaceAnalysis on ctx_id={ctx} (det_size: 320x320)...", flush=True)
             FACE_ANALYSER.prepare(ctx_id=ctx, det_size=(320, 320))
-            print(f"[ROOP.CORE] Face analyser initialized on device ctx_id={ctx} with providers: {providers}", flush=True)
+            print(f"[ROOP.CORE] Face analyser ready on ctx_id={ctx}!", flush=True)
     return FACE_ANALYSER
 
 
 def get_one_face(frame: Frame) -> Any:
     with THREAD_LOCK:
-        face = get_face_analyser().get(frame)
+        print("[ROOP.CORE] Running face detection on image...", flush=True)
+        faces = get_face_analyser().get(frame)
+        print(f"[ROOP.CORE] Face detection finished: found {len(faces)} face(s).", flush=True)
     try:
-        return min(face, key=lambda x: x.bbox[0])
-    except ValueError:
+        return min(faces, key=lambda x: x.bbox[0])
+    except (ValueError, IndexError):
         return None
 
 

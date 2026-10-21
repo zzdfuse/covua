@@ -17,6 +17,39 @@ import torch
 import onnxruntime
 import tensorflow
 
+# Global guard: Monkey-patch onnxruntime InferenceSession to force HEURISTIC conv search on CUDA.
+# Under cuDNN 9 (Linux / Google Colab), the default EXHAUSTIVE algorithm search causes
+# an infinite hang / deadlock during model initialization across all InsightFace models.
+_orig_ort_session_init = onnxruntime.InferenceSession.__init__
+
+def _safe_ort_session_init(self, path_or_bytes, *args, **kwargs):
+    providers = kwargs.get('providers')
+    if providers is not None:
+        new_providers = []
+        for p in providers:
+            if isinstance(p, tuple) and p[0] == 'CUDAExecutionProvider':
+                opts = dict(p[1]) if len(p) > 1 and isinstance(p[1], dict) else {}
+                opts.setdefault('cudnn_conv_algo_search', 'HEURISTIC')
+                opts.setdefault('arena_extend_strategy', 'kNextPowerOfTwo')
+                new_providers.append((p[0], opts))
+            elif p == 'CUDAExecutionProvider':
+                new_providers.append(('CUDAExecutionProvider', {
+                    'cudnn_conv_algo_search': 'HEURISTIC',
+                    'arena_extend_strategy': 'kNextPowerOfTwo',
+                }))
+            else:
+                new_providers.append(p)
+        kwargs['providers'] = new_providers
+        if 'provider_options' in kwargs:
+            del kwargs['provider_options']
+    model_name = os.path.basename(str(path_or_bytes)) if isinstance(path_or_bytes, str) else 'model'
+    print(f"[ROOP.ORT] Initializing ONNX session for {model_name}...", flush=True)
+    res = _orig_ort_session_init(self, path_or_bytes, *args, **kwargs)
+    print(f"[ROOP.ORT] ONNX session for {model_name} ready.", flush=True)
+    return res
+
+onnxruntime.InferenceSession.__init__ = _safe_ort_session_init
+
 import roop.globals
 import roop.metadata
 import roop.ui as ui
