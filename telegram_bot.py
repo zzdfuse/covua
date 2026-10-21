@@ -199,6 +199,30 @@ def check_cuda_and_prerequisites(silent=False, force=False):
     else:
         results['roop_model'] = ('INFO', 'Not cached yet (will auto-download on first render)')
 
+    # 6. InsightFace Face Detector / Analyser (buffalo_l)
+    insightface_dir = os.path.expanduser('~/.insightface/models/buffalo_l')
+    buffalo_det = os.path.join(insightface_dir, 'det_10g.onnx')
+    if os.path.exists(buffalo_det):
+        results['face_analyser'] = ('OK', 'buffalo_l (Face Analysis cached)')
+    else:
+        try:
+            logger.info("📥 Downloading InsightFace buffalo_l models (~300MB) for face detection...")
+            import urllib.request
+            import zipfile
+            import tempfile
+            os.makedirs(insightface_dir, exist_ok=True)
+            url = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+                tmp_zip = tmp.name
+            urllib.request.urlretrieve(url, tmp_zip)
+            with zipfile.ZipFile(tmp_zip, 'r') as zf:
+                zf.extractall(insightface_dir)
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+            results['face_analyser'] = ('OK', 'buffalo_l (Downloaded & ready)')
+        except Exception as e:
+            results['face_analyser'] = ('INFO', f'Not cached ({e})')
+
     video_cuda = results.get('ort_cuda', ('FAIL', ''))[0] == 'OK'
     image_cuda = results.get('torch_cuda', ('FAIL', ''))[0] == 'OK'
     ffmpeg_ok = results.get('ffmpeg', ('FAIL', ''))[0] == 'OK'
@@ -219,6 +243,7 @@ def check_cuda_and_prerequisites(silent=False, force=False):
         'ort_cuda': 'ONNX Runtime (Video/Roop)',
         'ffmpeg': 'FFmpeg Binary',
         'roop_model': 'Roop Face Swap Model',
+        'face_analyser': 'InsightFace (buffalo_l)',
     }
 
     for key, label in labels.items():
@@ -689,6 +714,7 @@ async def render_video(input_image, input_video, output_path):
     existing_pythonpath = os.environ.get('PYTHONPATH', '')
     env = {
         **os.environ,
+        'PYTHONUNBUFFERED': '1',
         'TF_CPP_MIN_LOG_LEVEL': '3',
         'OMP_NUM_THREADS': '1',
         'PYTHONPATH': f"{SCRIPT_DIR}:{existing_pythonpath}" if existing_pythonpath else SCRIPT_DIR,
@@ -697,14 +723,30 @@ async def render_video(input_image, input_video, output_path):
         *cmd,
         cwd=SCRIPT_DIR,
         env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
+
+    output_lines = []
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        decoded = line.decode('utf-8', errors='replace').rstrip()
+        if decoded:
+            output_lines.append(decoded)
+            if "cudart_stub.cc" not in decoded and "absl::InitializeLog" not in decoded:
+                logger.info(f"   [Roop] {decoded}")
+
     await proc.wait()
 
     if proc.returncode != 0:
-        raise Exception(f"Roop subprocess failed with exit code {proc.returncode}")
+        tail = "\n".join(output_lines[-15:])
+        raise Exception(f"Roop subprocess failed with exit code {proc.returncode}:\n{tail}")
 
     if not os.path.exists(output_path):
-        raise Exception(f"Roop exited 0 but output file missing: {output_path}")
+        tail = "\n".join(output_lines[-15:])
+        raise Exception(f"Roop exited 0 but output file missing: {output_path}\nOutput tail:\n{tail}")
 
     logger.info(f"✅ Video render completed: {output_path}")
 

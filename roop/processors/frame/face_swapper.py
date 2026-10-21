@@ -59,7 +59,7 @@ def get_face_swapper() -> Any:
                         'cudnn_conv_algo_search': 'EXHAUSTIVE',
                         'arena_extend_strategy': 'kNextPowerOfTwo',
                         # Keep GPU arena allocated — avoids malloc/free per frame
-                        'gpu_mem_limit': 5 * 1024 * 1024 * 1024,
+                        'gpu_mem_limit': 3 * 1024 * 1024 * 1024,
                         'cudnn_conv_use_max_workspace': '1',
                     }))
                 else:

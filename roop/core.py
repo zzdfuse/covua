@@ -123,21 +123,29 @@ def suggest_execution_threads() -> int:
 
 def limit_resources() -> None:
     # prevent tensorflow memory leak
-    gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-    for gpu in gpus:
-        tensorflow.config.experimental.set_memory_growth(gpu, True)
+    try:
+        gpus = tensorflow.config.experimental.list_physical_devices('GPU')
+        for gpu in gpus:
+            tensorflow.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
     # limit memory usage
     if roop.globals.max_memory:
-        memory = roop.globals.max_memory * 1024 ** 3
-        if platform.system().lower() == 'darwin':
-            memory = roop.globals.max_memory * 1024 ** 6
-        if platform.system().lower() == 'windows':
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
-        else:
-            import resource
-            resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+        try:
+            memory = roop.globals.max_memory * 1024 ** 3
+            if platform.system().lower() == 'darwin':
+                memory = roop.globals.max_memory * 1024 ** 6
+            if platform.system().lower() == 'windows':
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
+            elif 'CUDAExecutionProvider' not in roop.globals.execution_providers:
+                # Do not set RLIMIT_DATA on Linux when using CUDA, as it prevents CUDA/ONNXRuntime
+                # from allocating virtual memory arenas and causes aborts / ENOMEM
+                import resource
+                resource.setrlimit(resource.RLIMIT_DATA, (memory, memory))
+        except Exception:
+            pass
 
 
 def release_resources() -> None:

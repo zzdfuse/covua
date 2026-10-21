@@ -15,7 +15,7 @@ def _build_providers():
         if p == 'CUDAExecutionProvider':
             providers.append((p, {
                 'arena_extend_strategy': 'kNextPowerOfTwo',
-                'gpu_mem_limit': 3 * 1024 * 1024 * 1024,
+                'gpu_mem_limit': 1 * 1024 * 1024 * 1024,
             }))
         else:
             providers.append(p)
