@@ -27,10 +27,15 @@ def get_face_analyser() -> Any:
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            FACE_ANALYSER = insightface.app.FaceAnalysis(name='buffalo_l', providers=_build_providers())
+            # Clean string providers for robust InsightFace compatibility
+            providers = list(roop.globals.execution_providers)
+            if 'CUDAExecutionProvider' in providers and 'CPUExecutionProvider' not in providers:
+                providers.append('CPUExecutionProvider')
+            FACE_ANALYSER = insightface.app.FaceAnalysis(name='buffalo_l', providers=providers)
             # 320x320 is ~4x faster than 640x640 with negligible quality loss for typical video frames.
-            # Use 640 only if faces are very small in frame (e.g. crowd shots).
-            FACE_ANALYSER.prepare(ctx_id=0, det_size=(320, 320))
+            ctx = 0 if 'CUDAExecutionProvider' in providers else -1
+            FACE_ANALYSER.prepare(ctx_id=ctx, det_size=(320, 320))
+            print(f"[ROOP.CORE] Face analyser initialized on device ctx_id={ctx} with providers: {providers}", flush=True)
     return FACE_ANALYSER
 
 

@@ -64,7 +64,16 @@ def process_video(source_path: str, frame_paths: list[str], process_frames: Call
             orig_update(n)
             if progress.n - last_logged[0] >= step or progress.n >= total:
                 pct = (progress.n / total) * 100 if total else 100
-                print(f"[ROOP.CORE] Progress: {progress.n}/{total} frames ({pct:.1f}%)", flush=True)
+                vram_info = ""
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        free, tot = torch.cuda.mem_get_info()
+                        used_mb = (tot - free) / (1024 * 1024)
+                        vram_info = f" | GPU VRAM: {used_mb:.0f} MB"
+                except Exception:
+                    pass
+                print(f"[ROOP.CORE] Progress: {progress.n}/{total} frames ({pct:.1f}%{vram_info})", flush=True)
                 last_logged[0] = progress.n
         progress.update = update_with_log
 

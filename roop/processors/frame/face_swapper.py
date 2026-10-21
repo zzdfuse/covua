@@ -66,6 +66,20 @@ def get_face_swapper() -> Any:
                 else:
                     providers.append(p)
             FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=providers)
+            try:
+                active = FACE_SWAPPER.session.get_providers() if hasattr(FACE_SWAPPER, 'session') else roop.globals.execution_providers
+                update_status(f'Face swapper active providers: {active}', NAME)
+            except Exception:
+                pass
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    free, total = torch.cuda.mem_get_info()
+                    used_mb = (total - free) / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
+                    update_status(f'GPU VRAM in use: {used_mb:.1f} MB / {total_mb:.1f} MB', NAME)
+            except Exception:
+                pass
     return FACE_SWAPPER
 
 
