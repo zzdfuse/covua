@@ -35,7 +35,16 @@ from asyncio import Queue
 
 from telethon import TelegramClient, events
 from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo, DocumentAttributeVideo, DocumentAttributeImageSize
-from telethon.tl.functions.channels import CreateChannelRequest, CreateForumTopicRequest
+from telethon.tl.functions.channels import CreateChannelRequest
+
+# Telethon compatibility: Telethon 1.42+ (used on Google Colab) moved CreateForumTopicRequest to messages
+try:
+    from telethon.tl.functions.messages import CreateForumTopicRequest
+except ImportError:
+    try:
+        from telethon.tl.functions.channels import CreateForumTopicRequest
+    except ImportError:
+        CreateForumTopicRequest = None
 from telethon.events import MessageDeleted
 import gspread
 
@@ -765,14 +774,25 @@ async def process_render_queue():
 
 async def create_forum_topic(topic_name, chat_id):
     logger.info(f"🆕 Creating forum topic: '{topic_name}' in chat {chat_id}")
+    if CreateForumTopicRequest is None:
+        logger.error("❌ CreateForumTopicRequest is not available in the installed Telethon version")
+        return None
     try:
-        # For Telethon 1.42+, CreateForumTopicRequest uses 'peer' instead of 'channel'
-        topic = await client(CreateForumTopicRequest(
-            peer=chat_id,
-            title=topic_name,
-            icon_color=None,  # Optional: can set a color
-            icon_emoji_id=None  # Optional: can set an emoji
-        ))
+        # Telethon 1.42+ (in messages, used on Colab) uses 'peer'; older versions use 'channel'
+        try:
+            topic = await client(CreateForumTopicRequest(
+                peer=chat_id,
+                title=topic_name,
+                icon_color=None,  # Optional: can set a color
+                icon_emoji_id=None  # Optional: can set an emoji
+            ))
+        except TypeError:
+            topic = await client(CreateForumTopicRequest(
+                channel=chat_id,
+                title=topic_name,
+                icon_color=None,
+                icon_emoji_id=None
+            ))
         
         # Extract topic ID from response
         # The response structure may vary between versions
