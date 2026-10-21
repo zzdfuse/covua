@@ -15,7 +15,10 @@ import shutil
 import argparse
 import torch
 import onnxruntime
-import tensorflow
+try:
+    import tensorflow
+except ImportError:
+    tensorflow = None
 
 # Global guard: Monkey-patch onnxruntime InferenceSession to force HEURISTIC conv search on CUDA.
 # Under cuDNN 9 (Linux / Google Colab), the default EXHAUSTIVE algorithm search causes
@@ -155,13 +158,13 @@ def suggest_execution_threads() -> int:
 
 
 def limit_resources() -> None:
-    # prevent tensorflow memory leak
-    try:
-        gpus = tensorflow.config.experimental.list_physical_devices('GPU')
-        for gpu in gpus:
-            tensorflow.config.experimental.set_memory_growth(gpu, True)
-    except Exception:
-        pass
+    if tensorflow:
+        try:
+            gpus = tensorflow.config.experimental.list_physical_devices('GPU')
+            for gpu in gpus:
+                tensorflow.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            pass
     # limit memory usage
     if roop.globals.max_memory:
         try:

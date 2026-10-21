@@ -153,15 +153,58 @@ def check_cuda_and_prerequisites(silent=False, force=False):
 
     # 3. ONNX Runtime CUDA (Video Face Swapping / Roop)
     try:
-        import onnxruntime as ort
-        providers = ort.get_available_providers()
-        if 'CUDAExecutionProvider' in providers:
-            results['ort_cuda'] = ('OK', f'CUDAExecutionProvider available (Providers: {len(providers)})')
+        import importlib.metadata
+        cpu_installed = False
+        gpu_installed = False
+        try:
+            importlib.metadata.version('onnxruntime')
+            cpu_installed = True
+        except Exception:
+            pass
+        try:
+            importlib.metadata.version('onnxruntime-gpu')
+            gpu_installed = True
+        except Exception:
+            pass
+
+        if cpu_installed and gpu_installed:
+            results['ort_cuda'] = ('FAIL', 'FATAL: Both onnxruntime & onnxruntime-gpu installed!')
+            r = 'Both CPU onnxruntime and onnxruntime-gpu are installed in the same environment. CPU binaries overwrite GPU shared libraries, silently disabling CUDA.'
+            f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
+            issues.append(('ONNX Runtime Package Conflict', r, f))
         else:
-            results['ort_cuda'] = ('FAIL', f'Only fallback providers: {providers}')
-            r = 'CUDAExecutionProvider is missing from ONNX Runtime.'
-            f = 'Standard CPU onnxruntime is installed instead of onnxruntime-gpu. Fix: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
-            issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            if 'CUDAExecutionProvider' not in providers:
+                results['ort_cuda'] = ('FAIL', f'Only fallback providers: {providers}')
+                r = 'CUDAExecutionProvider is missing from ONNX Runtime.'
+                f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
+                issues.append(('ONNX Runtime (Video Face Swapping / Roop)', r, f))
+            else:
+                # Live validation test: Create an actual in-memory InferenceSession using CUDAExecutionProvider
+                try:
+                    import onnx
+                    from onnx import helper, TensorProto
+                    X = helper.make_tensor_value_info('X', TensorProto.FLOAT, [1])
+                    Y = helper.make_tensor_value_info('Y', TensorProto.FLOAT, [1])
+                    node = helper.make_node('Identity', ['X'], ['Y'])
+                    graph = helper.make_graph([node], 'test', [X], [Y])
+                    model = helper.make_model(graph)
+                    model_bytes = model.SerializeToString()
+                    
+                    test_sess = ort.InferenceSession(model_bytes, providers=['CUDAExecutionProvider'])
+                    active = test_sess.get_providers()
+                    if 'CUDAExecutionProvider' in active:
+                        results['ort_cuda'] = ('OK', f'CUDA verified (ORT v{ort.__version__})')
+                    else:
+                        results['ort_cuda'] = ('FAIL', f'Fell back to: {active}')
+                        issues.append(('ONNX Runtime CUDA Fallback', 'CUDA provider failed to activate during session creation.', 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'))
+                except Exception as sess_err:
+                    err_str = str(sess_err)
+                    results['ort_cuda'] = ('FAIL', f'CUDA session failed: {err_str[:35]}')
+                    r = f'ONNX Runtime CUDA failed to initialize: {err_str}'
+                    f = 'Run: pip uninstall -y onnxruntime onnxruntime-gpu && pip install onnxruntime-gpu'
+                    issues.append(('ONNX Runtime CUDA Initialization Error', r, f))
     except Exception as e:
         err_msg = str(e)
         results['ort_cuda'] = ('FAIL', f'onnxruntime error: {err_msg[:35]}')
