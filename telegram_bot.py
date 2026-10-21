@@ -30,6 +30,7 @@ import logging
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('CUDA_MODULE_LOADING', 'LAZY')   # faster CUDA init
 os.environ.setdefault('TF_FORCE_GPU_ALLOW_GROWTH', 'true')
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')     # silence TensorFlow cudart notices
 from datetime import datetime
 from asyncio import Queue
 
@@ -688,6 +689,7 @@ async def render_video(input_image, input_video, output_path):
     existing_pythonpath = os.environ.get('PYTHONPATH', '')
     env = {
         **os.environ,
+        'TF_CPP_MIN_LOG_LEVEL': '3',
         'OMP_NUM_THREADS': '1',
         'PYTHONPATH': f"{SCRIPT_DIR}:{existing_pythonpath}" if existing_pythonpath else SCRIPT_DIR,
     }
