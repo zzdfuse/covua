@@ -429,7 +429,7 @@ I2V_NEGATIVE       = (
 I2V_STEPS          = int(os.getenv('I2V_STEPS', '35'))
 I2V_GUIDANCE       = float(os.getenv('I2V_GUIDANCE', '9.0'))
 I2V_NUM_FRAMES     = int(os.getenv('I2V_NUM_FRAMES', '16'))
-I2V_FPS            = int(os.getenv('I2V_FPS', '8'))
+I2V_FPS            = int(os.getenv('I2V_FPS', '24'))
 I2V_TARGET_SIZE    = int(os.getenv('I2V_TARGET_SIZE', '512'))
 I2V_SEED           = int(os.getenv('I2V_SEED', '42'))
 
@@ -1366,7 +1366,7 @@ def _ensure_i2v_loaded():
     logger.info(f"✅ Image-to-Video pipeline ({I2V_MODEL_ID}) ready with CPU offload & VAE slicing")
 
 
-def _encode_frames_to_mp4(frames, output_path: str, fps: int = 8, loop_boomerang: bool = False):
+def _encode_frames_to_mp4(frames, output_path: str, fps: int = 24, loop_boomerang: bool = False):
     """Encode list of PIL.Image / numpy frames into a Telegram-ready H.264 MP4 using FFmpeg."""
     import subprocess
     import shutil
@@ -1522,7 +1522,7 @@ def _parse_i2v_command(raw_text: str) -> dict:
       --save <name>        : Register the generated video in Google Sheets under <name>
       --frames <N>         : Number of frames to generate (default 16)
       --steps <N>          : Number of denoising steps (default 35)
-      --fps <N>            : Output frames per second (default 8)
+      --fps <N>            : Output frames per second (default 24)
       --seed <N>           : Random seed (default 42)
     """
     text = (raw_text or '').strip()
@@ -1630,7 +1630,7 @@ async def handle_i2v_request(event):
             "• `--no-swap` — Skip automatic Roop face-swap identity lock\n"
             "• `--no-loop` — Disable boomerang loop\n"
             "• `--save <name>` — Save generated video to Google Sheets for `/domany`\n"
-            "• `--frames 16 --steps 35 --fps 8 --seed 42` — Custom generation tuning"
+            "• `--frames 16 --steps 35 --fps 24 --seed 42` — Custom generation tuning"
         )
         return
 
