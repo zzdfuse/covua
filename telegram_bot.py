@@ -1305,7 +1305,7 @@ async def handle_etcd_image(event):
             get_entity_id('group'),
             buf,
             reply_to=thread_map['etcd'],
-            caption='✅ Done!',
+            caption='✅ Done! (💬 Reply to this photo with any prompt or `/i2v <prompt>` to animate it into a video)',
         )
         await status.delete()
         logger.info("✅ Inpainting result sent to etcd thread")
@@ -1515,13 +1515,15 @@ def _run_i2v_sync(
 
 def _parse_i2v_command(raw_text: str) -> dict:
     """
-    Parse `/i2v [options] <prompt>` flags:
-      --swap       : Run Roop face-swap on the generated video using the input image
-      --loop       : Create a smooth forward+reverse boomerang loop
-      --frames <N> : Number of frames to generate (default 16)
-      --steps <N>  : Number of denoising steps (default 35)
-      --fps <N>    : Output frames per second (default 8)
-      --seed <N>   : Random seed (default 42)
+    Parse `/i2v [options] <prompt>` (or direct prompt in etcd thread) flags:
+      --swap / --no-swap   : Enable/disable automatic Roop face-swap polish (default: ON)
+      --loop / --no-loop   : Enable/disable seamless boomerang loop (default: ON)
+      --inpaint            : Run SD cloth-removal inpainting on the image first before animating
+      --save <name>        : Register the generated video in Google Sheets under <name>
+      --frames <N>         : Number of frames to generate (default 16)
+      --steps <N>          : Number of denoising steps (default 35)
+      --fps <N>            : Output frames per second (default 8)
+      --seed <N>           : Random seed (default 42)
     """
     text = (raw_text or '').strip()
     if text.lower().startswith('/i2v'):
@@ -1529,8 +1531,10 @@ def _parse_i2v_command(raw_text: str) -> dict:
 
     tokens = text.split()
     opts = {
-        'swap': False,
-        'loop': False,
+        'swap': True,
+        'loop': True,
+        'inpaint': False,
+        'save_name': None,
         'num_frames': None,
         'steps': None,
         'fps': None,
@@ -1545,9 +1549,21 @@ def _parse_i2v_command(raw_text: str) -> dict:
         if low == '--swap':
             opts['swap'] = True
             i += 1
+        elif low == '--no-swap':
+            opts['swap'] = False
+            i += 1
         elif low in ('--loop', '--boomerang'):
             opts['loop'] = True
             i += 1
+        elif low == '--no-loop':
+            opts['loop'] = False
+            i += 1
+        elif low == '--inpaint':
+            opts['inpaint'] = True
+            i += 1
+        elif low == '--save' and i + 1 < len(tokens):
+            opts['save_name'] = sanitize_video_name(tokens[i + 1])
+            i += 2
         elif low == '--frames' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
             opts['num_frames'] = max(8, min(32, int(tokens[i + 1])))
             i += 2
@@ -1607,22 +1623,26 @@ async def handle_i2v_request(event):
         await event.reply(
             "⚠️ **No image found for `/i2v`!**\n\n"
             "👉 **How to use:**\n"
-            "1️⃣ Send a photo with caption: `/i2v <your prompt>`\n"
+            "1️⃣ Send a photo with caption: `/i2v <your prompt>` (or any caption in `etcd` thread)\n"
             "2️⃣ Or reply to any photo with: `/i2v <your prompt>`\n\n"
             "✨ **Optional flags:**\n"
-            "• `/i2v --swap <prompt>` — Lock face identity with Roop face-swap\n"
-            "• `/i2v --loop <prompt>` — Smooth boomerang loop\n"
-            "• `/i2v --frames 16 --steps 35 <prompt>` — Custom frames/steps"
+            "• `--inpaint` — Remove clothing with SD inpainting first, then animate into video\n"
+            "• `--no-swap` — Skip automatic Roop face-swap identity lock\n"
+            "• `--no-loop` — Disable boomerang loop\n"
+            "• `--save <name>` — Save generated video to Google Sheets for `/domany`\n"
+            "• `--frames 16 --steps 35 --fps 8 --seed 42` — Custom generation tuning"
         )
         return
 
     prompt_disp = opts['prompt']
     flags_disp = []
+    if opts['inpaint']:
+        flags_disp.append("SD-Inpaint")
     if opts['swap']:
-        flags_disp.append("Face-Swap")
+        flags_disp.append("Face-Lock")
     if opts['loop']:
         flags_disp.append("Loop")
-    mode_str = f" ({', '.join(flags_disp)})" if flags_disp else ""
+    mode_str = f" ({' + '.join(flags_disp)})" if flags_disp else ""
 
     status_msg = await event.reply(
         f"⏳ **Image-to-Video Queued{mode_str}**\n"
@@ -1637,22 +1657,43 @@ async def handle_i2v_request(event):
     temp_img_path = None
 
     try:
-        image_bytes = await client.download_media(target_photo_msg, bytes)
-        if not image_bytes:
+        orig_image_bytes = await client.download_media(target_photo_msg, bytes)
+        if not orig_image_bytes:
             raise RuntimeError("Failed to download source image bytes from Telegram.")
 
+        i2v_source_bytes = orig_image_bytes
+
         async with gpu_inference_lock:
+            loop = asyncio.get_event_loop()
+
+            if opts['inpaint']:
+                await edit_message(
+                    status_msg,
+                    f"🔥 **Step 1/3: Running SD Inpainting (Cloth Removal)...**\n"
+                    f"📝 **Prompt:** `{prompt_disp}`"
+                )
+                i2v_source_bytes = await loop.run_in_executor(None, _run_inpaint_sync, orig_image_bytes)
+                import io as _io
+                inpaint_buf = _io.BytesIO(i2v_source_bytes)
+                inpaint_buf.name = f"inpainted_{target_photo_msg.id}.jpg"
+                await client.send_file(
+                    event.chat_id,
+                    inpaint_buf,
+                    reply_to=event.message.id,
+                    caption="✨ **Step 1 Complete:** Inpainted base frame ready — now animating into video...",
+                )
+
+            step_label = "Step 2/3: " if opts['inpaint'] else ""
             await edit_message(
                 status_msg,
-                f"🎬 **Generating Video on GPU{mode_str}...**\n"
+                f"🎬 **{step_label}Generating Video on GPU{mode_str}...**\n"
                 f"📝 **Prompt:** `{prompt_disp}`\n"
                 f"⚙️ _Running {I2V_MODEL_ID} (FP16)..._"
             )
-            loop = asyncio.get_event_loop()
             info = await loop.run_in_executor(
                 None,
                 _run_i2v_sync,
-                image_bytes,
+                i2v_source_bytes,
                 opts['prompt'],
                 raw_video_path,
                 opts['num_frames'],
@@ -1666,11 +1707,11 @@ async def handle_i2v_request(event):
             if opts['swap']:
                 await edit_message(
                     status_msg,
-                    f"🎭 **Enhancing Face Identity with Roop...**\n"
+                    f"🎭 **Locking Face Identity with Roop (GPU)...**\n"
                     f"📝 **Prompt:** `{prompt_disp}`"
                 )
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg', dir=os_dir['input_image']) as tmp_img:
-                    tmp_img.write(image_bytes)
+                    tmp_img.write(orig_image_bytes)
                     temp_img_path = tmp_img.name
                 swapped_path = os.path.join(os_dir['output'], f"i2v_swap_{target_photo_msg.id}_{ts}.mp4")
                 try:
@@ -1678,7 +1719,7 @@ async def handle_i2v_request(event):
                     if os.path.exists(swapped_path):
                         final_video_path = swapped_path
                 except Exception as swap_err:
-                    logger.warning(f"⚠️ [I2V] Optional Roop face-swap skipped/failed ({swap_err}); sending raw I2V video")
+                    logger.warning(f"⚠️ [I2V] Roop face-swap skipped/failed ({swap_err}); sending raw I2V video")
 
         caption = (
             f"🎬 **Image-to-Video Complete!**\n"
@@ -1687,13 +1728,17 @@ async def handle_i2v_request(event):
             f"🎞️ **Frames:** `{info['frames']}` @ `{info['fps']} fps` | "
             f"⏱️ `{info['elapsed']:.1f}s`"
         )
-        await client.send_file(
+        sent_video_msg = await client.send_file(
             event.chat_id,
             final_video_path,
             reply_to=event.message.id,
             caption=caption,
             supports_streaming=True,
         )
+
+        if opts['save_name'] and sent_video_msg:
+            await register_or_update_video(sent_video_msg.id, opts['save_name'], event)
+
         await status_msg.delete()
         logger.info(f"✅ [I2V] Sent generated video to chat {event.chat_id}: {final_video_path}")
 
@@ -2309,15 +2354,36 @@ async def delete_video_command(event):
 
 @client.on(events.NewMessage(chats=get_entity_id('group'), from_users=get_entity_id('user_id')))
 async def etcd_image_handler(event):
-    """Trigger SD inpainting when user posts a photo in the group etcd thread (375)."""
-    if not event.photo:
+    """
+    In group etcd thread (375):
+    - Photo with NO caption -> SD cloth-removal inpainting
+    - Photo WITH prompt caption (or text reply to a photo in etcd) -> Image-to-Video generation
+    """
+    if not event.reply_to:
         return
-    if (event.message.text or '').strip().lower().startswith('/i2v'):
+    reply_msg_id = getattr(event.reply_to, 'reply_to_msg_id', None)
+    reply_top_id = getattr(event.reply_to, 'reply_to_top_id', None)
+    in_etcd = (reply_msg_id == thread_map['etcd'] or reply_top_id == thread_map['etcd'])
+    if not in_etcd:
         return
-    if not event.reply_to or event.reply_to.reply_to_msg_id != thread_map['etcd']:
+
+    raw_text = (event.message.text or '').strip()
+    if raw_text.lower().startswith('/'):
+        # Explicit slash commands (/i2v, /domany, etc.) are handled by their dedicated handlers
         return
-    logger.info(f"🖼️ Photo received in group etcd thread — starting inpainting (msg {event.message.id})")
-    await handle_etcd_image(event)
+
+    if is_photo_message(event.message):
+        if raw_text:
+            logger.info(f"🎬 Photo with prompt received in etcd thread — starting Image-to-Video (msg {event.message.id})")
+            await handle_i2v_request(event)
+        else:
+            logger.info(f"🖼️ Photo received in group etcd thread — starting inpainting (msg {event.message.id})")
+            await handle_etcd_image(event)
+    elif raw_text and reply_msg_id and reply_msg_id != thread_map['etcd']:
+        replied_msg = await client.get_messages(event.chat_id, ids=reply_msg_id)
+        if is_photo_message(replied_msg):
+            logger.info(f"🎬 Prompt reply to photo {reply_msg_id} in etcd thread — starting Image-to-Video")
+            await handle_i2v_request(event)
 
 @client.on(events.NewMessage(
     chats=[get_entity_id('group'), get_entity_id('input_chat_id')],
