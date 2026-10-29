@@ -1207,6 +1207,23 @@ async def send_video(chat_name, thread_id, video_path, caption=""):
 # ============================================================================
 # SD INPAINTING HELPERS
 # ============================================================================
+def _patch_clip_transformers_compat(pipe):
+    """
+    Compatibility shim for transformers >= 5.6 where CLIPTextModel / CLIPVisionModel
+    flattened `.text_model` / `.vision_model` onto the top-level module while diffusers
+    pipelines (such as I2VGenXLPipeline) still access `text_encoder.text_model.final_layer_norm`.
+    Defining it as a class-level @property avoids registering a cyclic submodule in torch.nn.Module._modules.
+    """
+    if pipe is None:
+        return
+    te = getattr(pipe, 'text_encoder', None)
+    if te is not None and not hasattr(te, 'text_model'):
+        type(te).text_model = property(lambda self: self)
+    ie = getattr(pipe, 'image_encoder', None)
+    if ie is not None and not hasattr(ie, 'vision_model'):
+        type(ie).vision_model = property(lambda self: self)
+
+
 def _ensure_sd_loaded():
     global _sd_pipe, _seg_model
     import gc, torch
@@ -1216,6 +1233,7 @@ def _ensure_sd_loaded():
             "Please start on an environment with an NVIDIA GPU runtime (e.g. Google Colab with GPU enabled)."
         )
     if _seg_model is not None and _sd_pipe is not None:
+        _patch_clip_transformers_compat(_sd_pipe)
         _sd_pipe = _sd_pipe.to('cuda')
         return
     logger.info("📦 Loading SD inpainting models...")
@@ -1235,6 +1253,7 @@ def _ensure_sd_loaded():
         safety_checker=None,
         requires_safety_checker=False,
     )
+    _patch_clip_transformers_compat(_sd_pipe)
     _sd_pipe.enable_attention_slicing()
     _sd_pipe = _sd_pipe.to('cuda')
     logger.info("✅ SD inpainting models loaded")
@@ -1356,6 +1375,7 @@ def _ensure_i2v_loaded():
     torch.cuda.empty_cache()
 
     if _i2v_pipe is not None:
+        _patch_clip_transformers_compat(_i2v_pipe)
         return
 
     logger.info(f"📦 Loading Image-to-Video pipeline ({I2V_MODEL_ID}) in FP16 for Colab GPU...")
@@ -1372,6 +1392,8 @@ def _ensure_i2v_loaded():
             I2V_MODEL_ID,
             torch_dtype=torch.float16,
         )
+
+    _patch_clip_transformers_compat(_i2v_pipe)
 
     # Enable CPU offload + VAE slicing so peak VRAM stays ~5.5-6.5 GB on 15GB Tesla T4
     _i2v_pipe.enable_model_cpu_offload()
