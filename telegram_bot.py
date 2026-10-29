@@ -329,8 +329,14 @@ def check_cuda_and_prerequisites(silent=False, force=False):
     else:
         i_msg = "❌ UNAVAILABLE (SD inpainting strictly requires CUDA)"
 
+    if image_cuda and ffmpeg_ok:
+        i2v_msg = "✅ CUDA ACCELERATED (I2VGen-XL FP16 + CPU Offload)"
+    else:
+        i2v_msg = "❌ UNAVAILABLE (Requires PyTorch CUDA + FFmpeg)"
+
     banner.append(f"   🎥 Video Face Swap (Roop):  {v_msg}")
     banner.append(f"   🖼️ Image Inpaint (SD):      {i_msg}")
+    banner.append(f"   🎬 Image-to-Video (/i2v):   {i2v_msg}")
 
     if issues:
         banner.append("\n⚠️ PREREQUISITE ISSUES & ACTIONABLE FIXES:")
@@ -401,6 +407,31 @@ SD_STRENGTH    = float(os.getenv('SD_STRENGTH', '0.78'))
 SD_STEPS       = int(os.getenv('SD_STEPS', '75'))
 SD_TARGET_SIZE = int(os.getenv('SD_TARGET_SIZE', '512'))
 SD_SEED        = int(os.getenv('SD_SEED', '42'))
+
+# ============================================================================
+# IMAGE-TO-VIDEO (I2V) CONFIGURATION (/i2v command — Prompt + Image -> Video)
+# ============================================================================
+_i2v_pipe = None
+gpu_inference_lock = asyncio.Lock()
+
+I2V_MODEL_ID       = os.getenv('I2V_MODEL_ID', 'ali-vilab/i2vgen-xl')
+I2V_DEFAULT_PROMPT = (
+    'natural smooth movement, subtle breathing, gentle expression, '
+    'realistic motion, cinematic lighting, photorealistic, high quality, 8k uhd'
+)
+I2V_QUALITY_SUFFIX = ', (masterpiece, best quality, photorealistic, smooth natural motion, sharp focus:1.2)'
+I2V_NEGATIVE       = (
+    'Distorted, discontinuous, ugly, blurry, low resolution, motionless, static, '
+    'disfigured, disconnected limbs, ugly faces, incomplete arms, bad anatomy, '
+    'deformed, mutated, extra limbs, watermark, text, signature, worst quality, '
+    'low quality, jpeg artifacts, flickering'
+)
+I2V_STEPS          = int(os.getenv('I2V_STEPS', '35'))
+I2V_GUIDANCE       = float(os.getenv('I2V_GUIDANCE', '9.0'))
+I2V_NUM_FRAMES     = int(os.getenv('I2V_NUM_FRAMES', '16'))
+I2V_FPS            = int(os.getenv('I2V_FPS', '8'))
+I2V_TARGET_SIZE    = int(os.getenv('I2V_TARGET_SIZE', '512'))
+I2V_SEED           = int(os.getenv('I2V_SEED', '42'))
 
 # ============================================================================
 # VIDEO RENDERING QUEUE
@@ -1159,18 +1190,22 @@ async def send_video(chat_name, thread_id, video_path, caption=""):
 # ============================================================================
 def _ensure_sd_loaded():
     global _sd_pipe, _seg_model
-    if _seg_model is not None and _sd_pipe is not None:
-        return
-    logger.info("📦 Loading SD inpainting models...")
-    import torch
+    import gc, torch
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is not available for PyTorch. Stable Diffusion cloth removal requires a CUDA-capable GPU. "
             "Please start on an environment with an NVIDIA GPU runtime (e.g. Google Colab with GPU enabled)."
         )
+    if _seg_model is not None and _sd_pipe is not None:
+        _sd_pipe = _sd_pipe.to('cuda')
+        return
+    logger.info("📦 Loading SD inpainting models...")
     import albumentations as albu
     from diffusers import StableDiffusionInpaintPipeline
     from cloths_segmentation.pre_trained_models import create_model
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
     _seg_model = create_model('Unet_2020-10-30')
     _seg_model.eval()
@@ -1259,8 +1294,9 @@ async def handle_etcd_image(event):
     )
     try:
         image_bytes = await client.download_media(event.message, bytes)
-        loop = asyncio.get_event_loop()
-        result_bytes = await loop.run_in_executor(None, _run_inpaint_sync, image_bytes)
+        async with gpu_inference_lock:
+            loop = asyncio.get_event_loop()
+            result_bytes = await loop.run_in_executor(None, _run_inpaint_sync, image_bytes)
 
         import io as _io
         buf = _io.BytesIO(result_bytes)
@@ -1278,6 +1314,405 @@ async def handle_etcd_image(event):
         import traceback
         logger.error(traceback.format_exc())
         await status.edit(f'❌ Failed: {e}')
+
+
+# ============================================================================
+# IMAGE-TO-VIDEO (I2V) HELPERS (/i2v command — Prompt + Image -> Video)
+# ============================================================================
+def _ensure_i2v_loaded():
+    global _i2v_pipe, _sd_pipe
+    import gc, torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is not available for PyTorch. Image-to-Video generation requires a CUDA-capable GPU "
+            "(e.g. Google Colab with T4 GPU enabled)."
+        )
+    # Offload SD inpainting pipeline to CPU if it is currently occupying VRAM
+    if _sd_pipe is not None:
+        try:
+            _sd_pipe.to('cpu')
+        except Exception:
+            pass
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    if _i2v_pipe is not None:
+        return
+
+    logger.info(f"📦 Loading Image-to-Video pipeline ({I2V_MODEL_ID}) in FP16 for Colab GPU...")
+    from diffusers import I2VGenXLPipeline
+
+    try:
+        _i2v_pipe = I2VGenXLPipeline.from_pretrained(
+            I2V_MODEL_ID,
+            torch_dtype=torch.float16,
+            variant='fp16',
+        )
+    except Exception:
+        _i2v_pipe = I2VGenXLPipeline.from_pretrained(
+            I2V_MODEL_ID,
+            torch_dtype=torch.float16,
+        )
+
+    # Enable CPU offload + VAE slicing so peak VRAM stays ~5.5-6.5 GB on 15GB Tesla T4
+    _i2v_pipe.enable_model_cpu_offload()
+    if hasattr(_i2v_pipe, 'enable_vae_slicing'):
+        _i2v_pipe.enable_vae_slicing()
+    if hasattr(_i2v_pipe, 'enable_vae_tiling'):
+        try:
+            _i2v_pipe.enable_vae_tiling()
+        except Exception:
+            pass
+    logger.info(f"✅ Image-to-Video pipeline ({I2V_MODEL_ID}) ready with CPU offload & VAE slicing")
+
+
+def _encode_frames_to_mp4(frames, output_path: str, fps: int = 8, loop_boomerang: bool = False):
+    """Encode list of PIL.Image / numpy frames into a Telegram-ready H.264 MP4 using FFmpeg."""
+    import subprocess
+    import shutil
+    import numpy as np
+    from PIL import Image
+
+    if not frames:
+        raise ValueError("No video frames returned by I2V pipeline")
+
+    pil_frames = [
+        f.convert('RGB') if isinstance(f, Image.Image) else Image.fromarray(np.asarray(f)).convert('RGB')
+        for f in frames
+    ]
+    if loop_boomerang and len(pil_frames) > 2:
+        pil_frames = pil_frames + pil_frames[-2:0:-1]
+
+    w, h = pil_frames[0].size
+    # Ensure even dimensions for yuv420p H.264
+    w_even, h_even = (w // 2) * 2, (h // 2) * 2
+    if (w_even, h_even) != (w, h):
+        pil_frames = [f.resize((w_even, h_even), Image.LANCZOS) for f in pil_frames]
+        w, h = w_even, h_even
+
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if ffmpeg_bin:
+        raw_bytes = b''.join(np.asarray(f, dtype=np.uint8).tobytes() for f in pil_frames)
+        cmd = [
+            ffmpeg_bin, '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{w}x{h}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-crf', '19',
+            '-preset', 'fast',
+            '-movflags', '+faststart',
+            output_path,
+        ]
+        res = subprocess.run(cmd, input=raw_bytes, capture_output=True)
+        if res.returncode == 0 and os.path.exists(output_path):
+            return output_path
+        logger.warning(f"⚠️ FFmpeg encode returned {res.returncode}, falling back to OpenCV: {res.stderr.decode('utf-8', errors='ignore')[-200:]}")
+
+    import cv2
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_path, fourcc, float(fps), (w, h))
+    for f in pil_frames:
+        bgr = cv2.cvtColor(np.asarray(f, dtype=np.uint8), cv2.COLOR_RGB2BGR)
+        writer.write(bgr)
+    writer.release()
+    return output_path
+
+
+def _run_i2v_sync(
+    image_bytes: bytes,
+    prompt: str,
+    output_path: str,
+    num_frames: int = None,
+    steps: int = None,
+    guidance: float = None,
+    fps: int = None,
+    seed: int = None,
+    loop_boomerang: bool = False,
+) -> dict:
+    """
+    Generate an MP4 video from an input image and text prompt using I2VGenXLPipeline.
+    Blocking — always invoke via loop.run_in_executor.
+    """
+    import gc, io, time, torch
+    from PIL import Image
+
+    t0 = time.time()
+    _ensure_i2v_loaded()
+
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    w, h = pil_image.size
+
+    # Compute aspect-ratio-preserving dimensions aligned to 64-pixel multiples for 3D UNet
+    target = I2V_TARGET_SIZE
+    if w >= h:
+        nw = target
+        nh = int(round((target * h / w) / 64.0)) * 64
+    else:
+        nh = target
+        nw = int(round((target * w / h) / 64.0)) * 64
+    nw = max(256, min(704, (nw // 64) * 64))
+    nh = max(256, min(704, (nh // 64) * 64))
+
+    img_resized = pil_image.resize((nw, nh), Image.LANCZOS)
+
+    use_frames   = num_frames or I2V_NUM_FRAMES
+    use_steps    = steps or I2V_STEPS
+    use_guidance = guidance or I2V_GUIDANCE
+    use_fps      = fps or I2V_FPS
+    use_seed     = I2V_SEED if seed is None else seed
+
+    clean_prompt = (prompt or '').strip()
+    if not clean_prompt:
+        clean_prompt = I2V_DEFAULT_PROMPT
+    full_prompt = clean_prompt if 'masterpiece' in clean_prompt.lower() else f"{clean_prompt}{I2V_QUALITY_SUFFIX}"
+
+    logger.info(
+        f"🎬 [I2V] Generating video: size={nw}x{nh}, frames={use_frames}, "
+        f"steps={use_steps}, guidance={use_guidance}, fps={use_fps}, seed={use_seed}"
+    )
+    logger.info(f"📝 [I2V] Prompt: {full_prompt}")
+
+    generator = torch.Generator(device='cpu').manual_seed(use_seed)
+    with torch.inference_mode():
+        output = _i2v_pipe(
+            prompt=full_prompt,
+            image=img_resized,
+            negative_prompt=I2V_NEGATIVE,
+            height=nh,
+            width=nw,
+            num_frames=use_frames,
+            target_fps=use_fps,
+            num_inference_steps=use_steps,
+            guidance_scale=use_guidance,
+            decode_chunk_size=1,
+            generator=generator,
+        )
+    frames = output.frames[0]
+
+    _encode_frames_to_mp4(frames, output_path, fps=use_fps, loop_boomerang=loop_boomerang)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    elapsed = time.time() - t0
+    logger.info(f"✅ [I2V] Video saved to {output_path} in {elapsed:.1f}s")
+    return {
+        'output_path': output_path,
+        'width': nw,
+        'height': nh,
+        'frames': len(frames) * (2 if loop_boomerang else 1),
+        'fps': use_fps,
+        'elapsed': elapsed,
+        'prompt': clean_prompt,
+    }
+
+
+def _parse_i2v_command(raw_text: str) -> dict:
+    """
+    Parse `/i2v [options] <prompt>` flags:
+      --swap       : Run Roop face-swap on the generated video using the input image
+      --loop       : Create a smooth forward+reverse boomerang loop
+      --frames <N> : Number of frames to generate (default 16)
+      --steps <N>  : Number of denoising steps (default 35)
+      --fps <N>    : Output frames per second (default 8)
+      --seed <N>   : Random seed (default 42)
+    """
+    text = (raw_text or '').strip()
+    if text.lower().startswith('/i2v'):
+        text = text[4:].strip()
+
+    tokens = text.split()
+    opts = {
+        'swap': False,
+        'loop': False,
+        'num_frames': None,
+        'steps': None,
+        'fps': None,
+        'seed': None,
+        'prompt': '',
+    }
+    prompt_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        low = tok.lower()
+        if low == '--swap':
+            opts['swap'] = True
+            i += 1
+        elif low in ('--loop', '--boomerang'):
+            opts['loop'] = True
+            i += 1
+        elif low == '--frames' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
+            opts['num_frames'] = max(8, min(32, int(tokens[i + 1])))
+            i += 2
+        elif low == '--steps' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
+            opts['steps'] = max(10, min(75, int(tokens[i + 1])))
+            i += 2
+        elif low == '--fps' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
+            opts['fps'] = max(4, min(30, int(tokens[i + 1])))
+            i += 2
+        elif low == '--seed' and i + 1 < len(tokens) and tokens[i + 1].lstrip('-').isdigit():
+            opts['seed'] = int(tokens[i + 1])
+            i += 2
+        else:
+            prompt_tokens.append(tok)
+            i += 1
+
+    opts['prompt'] = ' '.join(prompt_tokens).strip() or I2V_DEFAULT_PROMPT
+    return opts
+
+
+async def _resolve_i2v_photo_message(event):
+    """
+    Find the target photo message for an `/i2v` command:
+    1. The message itself if sent as a photo with `/i2v ...` caption
+    2. The directly replied-to message if it contains a photo
+    3. The most recent photo posted in the same thread/chat
+    """
+    if is_photo_message(event.message):
+        return event.message
+
+    if event.reply_to and getattr(event.reply_to, 'reply_to_msg_id', None):
+        reply_id = event.reply_to.reply_to_msg_id
+        replied_msg = await client.get_messages(event.chat_id, ids=reply_id)
+        if is_photo_message(replied_msg):
+            return replied_msg
+
+        # If reply_id is a forum topic root (e.g. etcd thread 375), search recent messages in that topic
+        recent_topic_msgs = await client.get_messages(event.chat_id, limit=15, reply_to=reply_id)
+        for m in recent_topic_msgs:
+            if m and m.id != event.message.id and is_photo_message(m):
+                return m
+
+    recent_msgs = await client.get_messages(event.chat_id, limit=15)
+    for m in recent_msgs:
+        if m and m.id != event.message.id and is_photo_message(m):
+            return m
+
+    return None
+
+
+async def handle_i2v_request(event):
+    """Handle `/i2v [options] <prompt>` to generate a video from an image + text prompt."""
+    opts = _parse_i2v_command(event.message.text or '')
+    target_photo_msg = await _resolve_i2v_photo_message(event)
+
+    if not target_photo_msg:
+        await event.reply(
+            "⚠️ **No image found for `/i2v`!**\n\n"
+            "👉 **How to use:**\n"
+            "1️⃣ Send a photo with caption: `/i2v <your prompt>`\n"
+            "2️⃣ Or reply to any photo with: `/i2v <your prompt>`\n\n"
+            "✨ **Optional flags:**\n"
+            "• `/i2v --swap <prompt>` — Lock face identity with Roop face-swap\n"
+            "• `/i2v --loop <prompt>` — Smooth boomerang loop\n"
+            "• `/i2v --frames 16 --steps 35 <prompt>` — Custom frames/steps"
+        )
+        return
+
+    prompt_disp = opts['prompt']
+    flags_disp = []
+    if opts['swap']:
+        flags_disp.append("Face-Swap")
+    if opts['loop']:
+        flags_disp.append("Loop")
+    mode_str = f" ({', '.join(flags_disp)})" if flags_disp else ""
+
+    status_msg = await event.reply(
+        f"⏳ **Image-to-Video Queued{mode_str}**\n"
+        f"📝 **Prompt:** `{prompt_disp}`\n"
+        f"🖼️ **Source Photo ID:** `{target_photo_msg.id}`"
+    )
+
+    import tempfile
+    ts = int(datetime.now().timestamp())
+    raw_video_path = os.path.join(os_dir['output'], f"i2v_{target_photo_msg.id}_{ts}.mp4")
+    final_video_path = raw_video_path
+    temp_img_path = None
+
+    try:
+        image_bytes = await client.download_media(target_photo_msg, bytes)
+        if not image_bytes:
+            raise RuntimeError("Failed to download source image bytes from Telegram.")
+
+        async with gpu_inference_lock:
+            await edit_message(
+                status_msg,
+                f"🎬 **Generating Video on GPU{mode_str}...**\n"
+                f"📝 **Prompt:** `{prompt_disp}`\n"
+                f"⚙️ _Running {I2V_MODEL_ID} (FP16)..._"
+            )
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(
+                None,
+                _run_i2v_sync,
+                image_bytes,
+                opts['prompt'],
+                raw_video_path,
+                opts['num_frames'],
+                opts['steps'],
+                None,
+                opts['fps'],
+                opts['seed'],
+                opts['loop'],
+            )
+
+            if opts['swap']:
+                await edit_message(
+                    status_msg,
+                    f"🎭 **Enhancing Face Identity with Roop...**\n"
+                    f"📝 **Prompt:** `{prompt_disp}`"
+                )
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg', dir=os_dir['input_image']) as tmp_img:
+                    tmp_img.write(image_bytes)
+                    temp_img_path = tmp_img.name
+                swapped_path = os.path.join(os_dir['output'], f"i2v_swap_{target_photo_msg.id}_{ts}.mp4")
+                try:
+                    await render_video(temp_img_path, raw_video_path, swapped_path)
+                    if os.path.exists(swapped_path):
+                        final_video_path = swapped_path
+                except Exception as swap_err:
+                    logger.warning(f"⚠️ [I2V] Optional Roop face-swap skipped/failed ({swap_err}); sending raw I2V video")
+
+        caption = (
+            f"🎬 **Image-to-Video Complete!**\n"
+            f"📝 **Prompt:** `{info['prompt']}`\n"
+            f"📐 **Resolution:** `{info['width']}x{info['height']}` | "
+            f"🎞️ **Frames:** `{info['frames']}` @ `{info['fps']} fps` | "
+            f"⏱️ `{info['elapsed']:.1f}s`"
+        )
+        await client.send_file(
+            event.chat_id,
+            final_video_path,
+            reply_to=event.message.id,
+            caption=caption,
+            supports_streaming=True,
+        )
+        await status_msg.delete()
+        logger.info(f"✅ [I2V] Sent generated video to chat {event.chat_id}: {final_video_path}")
+
+    except Exception as e:
+        logger.error(f"❌ [I2V] Generation failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        await edit_message(status_msg, f"❌ **Image-to-Video failed:** `{e}`")
+    finally:
+        if temp_img_path and os.path.exists(temp_img_path):
+            try:
+                os.remove(temp_img_path)
+            except Exception:
+                pass
+        if final_video_path != raw_video_path and os.path.exists(raw_video_path):
+            try:
+                os.remove(raw_video_path)
+            except Exception:
+                pass
 
 # ============================================================================
 # MESSAGE HANDLERS
@@ -1646,6 +2081,8 @@ def is_topic_reply(topic, event):
 @client.on(events.NewMessage(chats=get_entity_id("input_chat_id"), from_users=get_entity_id("user_id")))
 async def new_photo_handler(event):
     logger.info(f"📨 New message received from user {get_entity_id('user_id')}")
+    if (event.message.text or "").strip().lower().startswith("/i2v"):
+        return
 
     if is_topic_reply("faces", event):
         if is_photo_message(event.message):
@@ -1875,10 +2312,22 @@ async def etcd_image_handler(event):
     """Trigger SD inpainting when user posts a photo in the group etcd thread (375)."""
     if not event.photo:
         return
+    if (event.message.text or '').strip().lower().startswith('/i2v'):
+        return
     if not event.reply_to or event.reply_to.reply_to_msg_id != thread_map['etcd']:
         return
     logger.info(f"🖼️ Photo received in group etcd thread — starting inpainting (msg {event.message.id})")
     await handle_etcd_image(event)
+
+@client.on(events.NewMessage(
+    chats=[get_entity_id('group'), get_entity_id('input_chat_id')],
+    from_users=get_entity_id('user_id'),
+    pattern=r'(?is)^/i2v(\s+.*|$)',
+))
+async def i2v_command_handler(event):
+    """Trigger Image-to-Video generation when user sends or replies with /i2v <prompt>."""
+    logger.info(f"🎬 /i2v command received (msg {event.message.id})")
+    await handle_i2v_request(event)
 
 @client.on(events.NewMessage(chats=get_entity_id("group"), pattern='/check_cuda'))
 async def check_cuda_command(event):
@@ -1888,6 +2337,7 @@ async def check_cuda_command(event):
     res = status['results']
     v_st = "✅ CUDA Accelerated" if status['video_cuda'] else "⚠️ CPU Fallback (Slow)"
     i_st = "✅ CUDA Accelerated" if status['image_cuda'] else "❌ CUDA Unavailable"
+    i2v_st = f"✅ CUDA Accelerated ({I2V_MODEL_ID})" if (status['image_cuda'] and status['ffmpeg_ok']) else "❌ Unavailable"
     
     msg = (
         f"🖥️ **System & Acceleration Status:**\n\n"
@@ -1898,6 +2348,7 @@ async def check_cuda_command(event):
         f"📊 **Readiness:**\n"
         f"• 🎥 Video Face Swap: {v_st}\n"
         f"• 🖼️ Image Inpainting: {i_st}\n"
+        f"• 🎬 Image-to-Video (`/i2v`): {i2v_st}\n"
     )
     if status['issues']:
         msg += "\n⚠️ **Issues Detected:**\n"
@@ -1945,6 +2396,7 @@ async def main():
         logger.info("   • /check_cuda - Check GPU & CUDA acceleration status")
         logger.info("   • /delete_image <name> - Manually delete image by name")
         logger.info("   • /delete_video <name> - Manually delete video by name")
+        logger.info("   • /i2v [--swap] [--loop] <prompt> - Generate video from photo + prompt")
         logger.info("🔥 SD inpainting: upload a photo to group etcd thread (375) to trigger cloth removal")
         logger.info("🗑️ Auto-deletion enabled: Deleting messages will remove entries from sheets")
         logger.info("⚡ Non-blocking rendering: Bot stays responsive while processing videos")
