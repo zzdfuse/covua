@@ -349,7 +349,7 @@ def check_cuda_and_prerequisites(silent=False, force=False):
         i_msg = "❌ UNAVAILABLE (SD inpainting strictly requires CUDA)"
 
     if image_cuda and ffmpeg_ok:
-        i2v_msg = "✅ CUDA ACCELERATED (I2VGen-XL FP16 + CPU Offload)"
+        i2v_msg = "✅ CUDA ACCELERATED (LTX-Video-0.9.5 DiT + Framewise VAE)"
     else:
         i2v_msg = "❌ UNAVAILABLE (Requires PyTorch CUDA + FFmpeg)"
 
@@ -433,24 +433,27 @@ SD_SEED        = int(os.getenv('SD_SEED', '42'))
 _i2v_pipe = None
 gpu_inference_lock = asyncio.Lock()
 
-I2V_MODEL_ID       = os.getenv('I2V_MODEL_ID', 'ali-vilab/i2vgen-xl')
-I2V_DEFAULT_PROMPT = (
-    'natural smooth movement, subtle breathing, gentle expression, '
-    'realistic motion, cinematic lighting, photorealistic, high quality, 8k uhd'
+I2V_MODEL_ID        = os.getenv('I2V_MODEL_ID', 'Lightricks/LTX-Video-0.9.5')
+I2V_TEXT_ENCODER_ID = os.getenv('I2V_TEXT_ENCODER_ID', 'city96/t5-v1_1-xxl-encoder-bf16')
+I2V_DEFAULT_PROMPT  = (
+    'The subject moves naturally and smoothly with realistic breathing, subtle expressions, '
+    'fluid camera motion, lifelike physics, sharp details, and cinematic lighting in high definition.'
 )
-I2V_QUALITY_SUFFIX = ', (masterpiece, best quality, photorealistic, smooth natural motion, sharp focus:1.2)'
-I2V_NEGATIVE       = (
-    'Distorted, discontinuous, ugly, blurry, low resolution, motionless, static, '
-    'disfigured, disconnected limbs, ugly faces, incomplete arms, bad anatomy, '
-    'deformed, mutated, extra limbs, watermark, text, signature, worst quality, '
-    'low quality, jpeg artifacts, flickering'
+I2V_QUALITY_SUFFIX  = (
+    '. Cinematic photorealistic video, smooth natural motion, high definition, '
+    'sharp focus, temporally consistent details.'
 )
-I2V_STEPS          = int(os.getenv('I2V_STEPS', '35'))
-I2V_GUIDANCE       = float(os.getenv('I2V_GUIDANCE', '9.0'))
-I2V_NUM_FRAMES     = int(os.getenv('I2V_NUM_FRAMES', '16'))
-I2V_FPS            = int(os.getenv('I2V_FPS', '24'))
-I2V_TARGET_SIZE    = int(os.getenv('I2V_TARGET_SIZE', '512'))
-I2V_SEED           = int(os.getenv('I2V_SEED', '42'))
+I2V_NEGATIVE        = (
+    'worst quality, inconsistent motion, blurry, jittery, distorted, morphing, '
+    'deformed, disfigured, bad anatomy, extra limbs, flickering, static, motionless, '
+    'watermark, text, signature, low resolution, compression artifacts'
+)
+I2V_STEPS           = int(os.getenv('I2V_STEPS', '40'))
+I2V_GUIDANCE        = float(os.getenv('I2V_GUIDANCE', '3.5'))
+I2V_NUM_FRAMES      = int(os.getenv('I2V_NUM_FRAMES', '161'))   # 161 frames @ 24fps = 6.7s (supports up to 241 = 10s)
+I2V_FPS             = int(os.getenv('I2V_FPS', '24'))
+I2V_TARGET_SIZE     = int(os.getenv('I2V_TARGET_SIZE', '704'))  # 704x480 / 480x704 (32px-aligned DiT resolution)
+I2V_SEED            = int(os.getenv('I2V_SEED', '42'))
 
 # ============================================================================
 # VIDEO RENDERING QUEUE
@@ -1225,7 +1228,7 @@ def _patch_clip_transformers_compat(pipe):
 
 
 def _ensure_sd_loaded():
-    global _sd_pipe, _seg_model
+    global _sd_pipe, _seg_model, _i2v_pipe
     import gc, torch
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -1236,6 +1239,14 @@ def _ensure_sd_loaded():
         _patch_clip_transformers_compat(_sd_pipe)
         _sd_pipe = _sd_pipe.to('cuda')
         return
+
+    # Free LTX-Video I2V pipeline if loaded so Colab 12.7 GB CPU RAM / 15 GB GPU VRAM are never overcommitted
+    if _i2v_pipe is not None:
+        logger.info("🧹 Releasing I2V pipeline from memory before loading SD inpainting...")
+        _i2v_pipe = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
     logger.info("📦 Loading SD inpainting models...")
     import albumentations as albu
     from diffusers import StableDiffusionInpaintPipeline
@@ -1358,53 +1369,120 @@ async def handle_etcd_image(event):
 # IMAGE-TO-VIDEO (I2V) HELPERS (/i2v command — Prompt + Image -> Video)
 # ============================================================================
 def _ensure_i2v_loaded():
-    global _i2v_pipe, _sd_pipe
-    import gc, torch
+    """
+    Load Lightricks/LTX-Video-0.9.5 (LTXConditionPipeline) with a split GPU/CPU memory layout
+    engineered specifically for Google Colab Free (12.7 GB CPU RAM + 15.0 GB Tesla T4 VRAM):
+      - `transformer` (3.58 GB) + `vae` (2.32 GB) live directly on CUDA VRAM (5.90 GB static, 0 GB CPU RAM)
+      - `vae` uses spatial tiling + temporal framewise decoding (`use_framewise_decoding=True`) for 161-241 frames
+      - `text_encoder` (8.87 GB half-precision T5-XXL from `city96/t5-v1_1-xxl-encoder-bf16`) stays in CPU RAM
+        with block-level group offloading (only 2 transformer blocks / ~0.7 GB streamed to CUDA at a time)
+    """
+    global _i2v_pipe, _sd_pipe, _seg_model
+    import gc, subprocess, torch
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is not available for PyTorch. Image-to-Video generation requires a CUDA-capable GPU "
             "(e.g. Google Colab with T4 GPU enabled)."
         )
-    # Offload SD inpainting pipeline to CPU if it is currently occupying VRAM
-    if _sd_pipe is not None:
-        try:
-            _sd_pipe.to('cpu')
-        except Exception:
-            pass
+
+    # Free SD inpainting models completely from RAM & VRAM so Colab's 12.7 GB CPU RAM has full headroom for T5-XXL
+    if _sd_pipe is not None or _seg_model is not None:
+        logger.info("🧹 Releasing SD inpainting models from memory to free RAM/VRAM for LTX-Video...")
+        _sd_pipe = None
+        _seg_model = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    if _i2v_pipe is not None:
+        return
+
+    # Ensure sentencepiece is installed for T5TokenizerFast fallback compatibility
+    try:
+        import sentencepiece  # noqa: F401
+    except ImportError:
+        logger.info("📥 Installing sentencepiece for T5 tokenizer...")
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'sentencepiece>=0.2.0'], check=False)
+
+    # Use native hardware Tensor Core dtype: FP16 on Turing (Tesla T4 sm_75), BF16 on Ampere+ (L4/A100 sm_80+)
+    major_cc = torch.cuda.get_device_capability(0)[0]
+    dtype = torch.bfloat16 if major_cc >= 8 else torch.float16
+    dtype_name = 'BF16' if dtype == torch.bfloat16 else 'FP16'
+
+    logger.info(
+        f"📦 Loading LTX-Video 0.9.5 DiT pipeline ({I2V_MODEL_ID}) in {dtype_name} "
+        f"(Split GPU/CPU mode for Colab)..."
+    )
+    from transformers import T5EncoderModel, T5TokenizerFast
+    from diffusers import (
+        AutoencoderKLLTXVideo,
+        FlowMatchEulerDiscreteScheduler,
+        LTXConditionPipeline,
+        LTXVideoTransformer3DModel,
+    )
+
+    # 1. Scheduler & Tokenizer
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(I2V_MODEL_ID, subfolder='scheduler')
+    tokenizer = T5TokenizerFast.from_pretrained(I2V_MODEL_ID, subfolder='tokenizer')
+
+    # 2. 3D DiT Transformer (3.58 GB) -> move immediately to GPU VRAM so CPU RAM stays near 0
+    logger.info("   ↳ [1/3] Loading LTX 3D DiT Transformer (3.58 GB) onto GPU...")
+    transformer = LTXVideoTransformer3DModel.from_pretrained(
+        I2V_MODEL_ID,
+        subfolder='transformer',
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    ).to('cuda')
     gc.collect()
     torch.cuda.empty_cache()
 
-    if _i2v_pipe is not None:
-        _patch_clip_transformers_compat(_i2v_pipe)
-        return
+    # 3. Causal 3D Video VAE (2.32 GB) -> move immediately to GPU VRAM + enable spatial & temporal framewise tiling
+    logger.info("   ↳ [2/3] Loading LTX Causal 3D VAE (2.32 GB) onto GPU with framewise temporal tiling...")
+    vae = AutoencoderKLLTXVideo.from_pretrained(
+        I2V_MODEL_ID,
+        subfolder='vae',
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    ).to('cuda')
+    vae.enable_tiling()
+    vae.use_framewise_decoding = True
+    vae.use_framewise_encoding = True
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    logger.info(f"📦 Loading Image-to-Video pipeline ({I2V_MODEL_ID}) in FP16 for Colab GPU...")
-    from diffusers import I2VGenXLPipeline
-
+    # 4. Half-precision T5-XXL Text Encoder (8.87 GB single shard) -> keep on CPU RAM with 2-block CUDA streaming
+    logger.info(f"   ↳ [3/3] Loading half-precision T5-XXL Text Encoder ({I2V_TEXT_ENCODER_ID}, 8.87 GB) with block offload...")
+    text_encoder = T5EncoderModel.from_pretrained(
+        I2V_TEXT_ENCODER_ID,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
     try:
-        _i2v_pipe = I2VGenXLPipeline.from_pretrained(
-            I2V_MODEL_ID,
-            torch_dtype=torch.float16,
-            variant='fp16',
+        from diffusers.hooks import apply_group_offloading
+        apply_group_offloading(
+            text_encoder,
+            onload_device=torch.device('cuda'),
+            offload_device=torch.device('cpu'),
+            offload_type='block_level',
+            num_blocks_per_group=2,
         )
-    except Exception:
-        _i2v_pipe = I2VGenXLPipeline.from_pretrained(
-            I2V_MODEL_ID,
-            torch_dtype=torch.float16,
-        )
+    except Exception as hook_err:
+        logger.warning(f"⚠️ Group offloading unavailable ({hook_err}); falling back to accelerate.cpu_offload")
+        from accelerate import cpu_offload
+        cpu_offload(text_encoder, execution_device=torch.device('cuda'))
 
-    _patch_clip_transformers_compat(_i2v_pipe)
-
-    # Enable CPU offload + VAE slicing so peak VRAM stays ~5.5-6.5 GB on 15GB Tesla T4
-    _i2v_pipe.enable_model_cpu_offload()
-    if hasattr(_i2v_pipe, 'enable_vae_slicing'):
-        _i2v_pipe.enable_vae_slicing()
-    if hasattr(_i2v_pipe, 'enable_vae_tiling'):
-        try:
-            _i2v_pipe.enable_vae_tiling()
-        except Exception:
-            pass
-    logger.info(f"✅ Image-to-Video pipeline ({I2V_MODEL_ID}) ready with CPU offload & VAE slicing")
+    _i2v_pipe = LTXConditionPipeline(
+        scheduler=scheduler,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        transformer=transformer,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(
+        f"✅ LTX-Video 0.9.5 pipeline ready ({dtype_name}: DiT+VAE on GPU, T5-XXL block-offloaded, "
+        f"framewise 161-241f VAE decoding enabled)"
+    )
 
 
 def _encode_frames_to_mp4(frames, output_path: str, fps: int = 24, loop_boomerang: bool = False):
@@ -1476,11 +1554,14 @@ def _run_i2v_sync(
     loop_boomerang: bool = False,
 ) -> dict:
     """
-    Generate an MP4 video from an input image and text prompt using I2VGenXLPipeline.
+    Generate a high-definition MP4 video (6.7s to 10.0s @ 24fps) from an input image and text prompt
+    using Lightricks/LTX-Video-0.9.5 (`LTXConditionPipeline`).
+    Frame 0 is directly conditioned on the exact input photo in latent space (no face-swap needed).
     Blocking — always invoke via loop.run_in_executor.
     """
     import gc, io, time, torch
     from PIL import Image
+    from diffusers.pipelines.ltx.pipeline_ltx_condition import LTXVideoCondition
 
     t0 = time.time()
     _ensure_i2v_loaded()
@@ -1488,49 +1569,66 @@ def _run_i2v_sync(
     pil_image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
     w, h = pil_image.size
 
-    # Compute aspect-ratio-preserving dimensions aligned to 64-pixel multiples for 3D UNet
+    # Compute aspect-ratio-preserving dimensions aligned to 32-pixel multiples for LTX DiT
+    # (e.g., 704x480 for 16:9/3:2 landscape, 480x704 for portrait, 512x512 for square)
     target = I2V_TARGET_SIZE
-    if w >= h:
+    if abs(w - h) <= max(w, h) * 0.12:
+        nw, nh = 512, 512
+    elif w > h:
         nw = target
-        nh = int(round((target * h / w) / 64.0)) * 64
+        nh = int(round((target * h / w) / 32.0)) * 32
+        nh = max(384, min(512, nh))
     else:
         nh = target
-        nw = int(round((target * w / h) / 64.0)) * 64
-    nw = max(256, min(704, (nw // 64) * 64))
-    nh = max(256, min(704, (nh // 64) * 64))
+        nw = int(round((target * w / h) / 32.0)) * 32
+        nw = max(384, min(512, nw))
+    nw = max(384, min(768, (nw // 32) * 32))
+    nh = max(384, min(768, (nh // 32) * 32))
 
     img_resized = pil_image.resize((nw, nh), Image.LANCZOS)
 
-    use_frames   = num_frames or I2V_NUM_FRAMES
+    use_fps      = fps or I2V_FPS
+    raw_frames   = num_frames or I2V_NUM_FRAMES
+    # LTX-Video 3D causal VAE requires num_frames = 8 * k + 1 (e.g., 161 = 6.7s, 241 = 10.0s @ 24fps)
+    use_frames   = max(25, min(257, ((raw_frames - 1) // 8) * 8 + 1))
     use_steps    = steps or I2V_STEPS
     use_guidance = guidance or I2V_GUIDANCE
-    use_fps      = fps or I2V_FPS
     use_seed     = I2V_SEED if seed is None else seed
 
     clean_prompt = (prompt or '').strip()
     if not clean_prompt:
         clean_prompt = I2V_DEFAULT_PROMPT
-    full_prompt = clean_prompt if 'masterpiece' in clean_prompt.lower() else f"{clean_prompt}{I2V_QUALITY_SUFFIX}"
+    full_prompt = (
+        clean_prompt
+        if ('cinematic' in clean_prompt.lower() or 'photorealistic' in clean_prompt.lower())
+        else f"{clean_prompt.rstrip('.')}{I2V_QUALITY_SUFFIX}"
+    )
 
+    duration_s = use_frames / float(use_fps)
     logger.info(
-        f"🎬 [I2V] Generating video: size={nw}x{nh}, frames={use_frames}, "
-        f"steps={use_steps}, guidance={use_guidance}, fps={use_fps}, seed={use_seed}"
+        f"🎬 [I2V] Generating LTX-Video: size={nw}x{nh}, frames={use_frames} ({duration_s:.1f}s @ {use_fps}fps), "
+        f"steps={use_steps}, guidance={use_guidance}, seed={use_seed}"
     )
     logger.info(f"📝 [I2V] Prompt: {full_prompt}")
 
-    generator = torch.Generator(device='cpu').manual_seed(use_seed)
+    condition = LTXVideoCondition(image=img_resized, frame_index=0, strength=1.0)
+    generator = torch.Generator(device='cuda').manual_seed(use_seed)
+
     with torch.inference_mode():
         output = _i2v_pipe(
+            conditions=[condition],
             prompt=full_prompt,
-            image=img_resized,
             negative_prompt=I2V_NEGATIVE,
-            height=nh,
             width=nw,
+            height=nh,
             num_frames=use_frames,
-            target_fps=use_fps,
+            frame_rate=use_fps,
             num_inference_steps=use_steps,
             guidance_scale=use_guidance,
-            decode_chunk_size=1,
+            guidance_rescale=0.7,
+            image_cond_noise_scale=0.05,
+            decode_timestep=0.05,
+            decode_noise_scale=0.025,
             generator=generator,
         )
     frames = output.frames[0]
@@ -1541,14 +1639,16 @@ def _run_i2v_sync(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    total_frames = len(frames) * (2 if loop_boomerang else 1)
     elapsed = time.time() - t0
-    logger.info(f"✅ [I2V] Video saved to {output_path} in {elapsed:.1f}s")
+    logger.info(f"✅ [I2V] Video saved to {output_path} ({total_frames} frames, {total_frames/use_fps:.1f}s) in {elapsed:.1f}s")
     return {
         'output_path': output_path,
         'width': nw,
         'height': nh,
-        'frames': len(frames) * (2 if loop_boomerang else 1),
+        'frames': total_frames,
         'fps': use_fps,
+        'duration': total_frames / float(use_fps),
         'elapsed': elapsed,
         'prompt': clean_prompt,
     }
@@ -1557,14 +1657,15 @@ def _run_i2v_sync(
 def _parse_i2v_command(raw_text: str) -> dict:
     """
     Parse `/i2v [options] <prompt>` (or direct prompt in etcd thread) flags:
-      --swap / --no-swap   : Enable/disable automatic Roop face-swap polish (default: ON)
-      --loop / --no-loop   : Enable/disable seamless boomerang loop (default: ON)
-      --inpaint            : Run SD cloth-removal inpainting on the image first before animating
-      --save <name>        : Register the generated video in Google Sheets under <name>
-      --frames <N>         : Number of frames to generate (default 16)
-      --steps <N>          : Number of denoising steps (default 35)
+      --seconds <S>        : Video duration in seconds (default ~6.7s / 161f; use `--seconds 10` for 10s / 241f)
+      --frames <N>         : Number of frames (`8*k + 1`, default 161 = 6.7s, up to 241 = 10s @ 24fps)
+      --steps <N>          : Number of denoising steps (default 40)
       --fps <N>            : Output frames per second (default 24)
       --seed <N>           : Random seed (default 42)
+      --inpaint            : Run SD cloth-removal inpainting on the image first before animating
+      --swap / --no-swap   : Enable/disable optional Roop post-render face-swap (default: OFF — LTX preserves exact input frame)
+      --loop / --no-loop   : Enable/disable boomerang loop (default: OFF)
+      --save <name>        : Register the generated video in Google Sheets under <name>
     """
     text = (raw_text or '').strip()
     if text.lower().startswith('/i2v'):
@@ -1572,10 +1673,11 @@ def _parse_i2v_command(raw_text: str) -> dict:
 
     tokens = text.split()
     opts = {
-        'swap': True,
-        'loop': True,
+        'swap': False,
+        'loop': False,
         'inpaint': False,
         'save_name': None,
+        'seconds': None,
         'num_frames': None,
         'steps': None,
         'fps': None,
@@ -1605,14 +1707,24 @@ def _parse_i2v_command(raw_text: str) -> dict:
         elif low == '--save' and i + 1 < len(tokens):
             opts['save_name'] = sanitize_video_name(tokens[i + 1])
             i += 2
+        elif low in ('--seconds', '--duration', '-d') and i + 1 < len(tokens):
+            try:
+                sec = max(2.0, min(10.5, float(tokens[i + 1])))
+                opts['seconds'] = sec
+                i += 2
+                continue
+            except ValueError:
+                pass
+            prompt_tokens.append(tok)
+            i += 1
         elif low == '--frames' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
-            opts['num_frames'] = max(8, min(32, int(tokens[i + 1])))
+            opts['num_frames'] = max(25, min(257, int(tokens[i + 1])))
             i += 2
         elif low == '--steps' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
             opts['steps'] = max(10, min(75, int(tokens[i + 1])))
             i += 2
         elif low == '--fps' and i + 1 < len(tokens) and tokens[i + 1].isdigit():
-            opts['fps'] = max(4, min(30, int(tokens[i + 1])))
+            opts['fps'] = max(8, min(30, int(tokens[i + 1])))
             i += 2
         elif low == '--seed' and i + 1 < len(tokens) and tokens[i + 1].lstrip('-').isdigit():
             opts['seed'] = int(tokens[i + 1])
@@ -1620,6 +1732,11 @@ def _parse_i2v_command(raw_text: str) -> dict:
         else:
             prompt_tokens.append(tok)
             i += 1
+
+    if opts['seconds'] is not None and opts['num_frames'] is None:
+        target_fps = opts['fps'] or I2V_FPS
+        raw_f = int(round(opts['seconds'] * target_fps))
+        opts['num_frames'] = max(25, min(257, ((raw_f - 1) // 8) * 8 + 1))
 
     opts['prompt'] = ' '.join(prompt_tokens).strip() or I2V_DEFAULT_PROMPT
     return opts
@@ -1666,12 +1783,13 @@ async def handle_i2v_request(event):
             "👉 **How to use:**\n"
             "1️⃣ Send a photo with caption: `/i2v <your prompt>` (or any caption in `etcd` thread)\n"
             "2️⃣ Or reply to any photo with: `/i2v <your prompt>`\n\n"
-            "✨ **Optional flags:**\n"
+            "✨ **Optional flags (LTX-Video 0.9.5 HD Engine):**\n"
+            "• `--seconds 10` — Generate a full **10-second** video (`241` frames @ `24fps`; default is `6.7s` / `161` frames)\n"
             "• `--inpaint` — Remove clothing with SD inpainting first, then animate into video\n"
-            "• `--no-swap` — Skip automatic Roop face-swap identity lock\n"
-            "• `--no-loop` — Disable boomerang loop\n"
+            "• `--swap` — Optional post-render Roop face-swap (OFF by default; LTX locks Frame 0 directly)\n"
+            "• `--loop` — Enable boomerang ping-pong loop (OFF by default)\n"
             "• `--save <name>` — Save generated video to Google Sheets for `/domany`\n"
-            "• `--frames 16 --steps 35 --fps 24 --seed 42` — Custom generation tuning"
+            "• `--frames 241 --steps 40 --fps 24 --seed 42` — Custom generation tuning"
         )
         return
 
@@ -1724,12 +1842,14 @@ async def handle_i2v_request(event):
                     caption="✨ **Step 1 Complete:** Inpainted base frame ready — now animating into video...",
                 )
 
-            step_label = "Step 2/3: " if opts['inpaint'] else ""
+            step_label = "Step 2/2: " if opts['inpaint'] else ""
+            target_f = opts['num_frames'] or I2V_NUM_FRAMES
+            target_fps = opts['fps'] or I2V_FPS
             await edit_message(
                 status_msg,
-                f"🎬 **{step_label}Generating Video on GPU{mode_str}...**\n"
+                f"🎬 **{step_label}Generating HD Video on GPU{mode_str}...**\n"
                 f"📝 **Prompt:** `{prompt_disp}`\n"
-                f"⚙️ _Running {I2V_MODEL_ID} (FP16)..._"
+                f"⚙️ _Running {I2V_MODEL_ID} ({target_f} frames / ~{target_f/target_fps:.1f}s @ {target_fps}fps)..._"
             )
             info = await loop.run_in_executor(
                 None,
@@ -1766,7 +1886,7 @@ async def handle_i2v_request(event):
             f"🎬 **Image-to-Video Complete!**\n"
             f"📝 **Prompt:** `{info['prompt']}`\n"
             f"📐 **Resolution:** `{info['width']}x{info['height']}` | "
-            f"🎞️ **Frames:** `{info['frames']}` @ `{info['fps']} fps` | "
+            f"🎞️ **Length:** `{info['duration']:.1f}s` (`{info['frames']}f` @ `{info['fps']}fps`) | "
             f"⏱️ `{info['elapsed']:.1f}s`"
         )
         sent_video_msg = await client.send_file(

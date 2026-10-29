@@ -23,8 +23,9 @@ tqdm>=4.66.4
 # ONNX Runtime with CUDA GPU acceleration
 onnxruntime-gpu>=1.20.0
 
-# Optional SD Inpainting (for ETCD thread cloth removal)
-diffusers>=0.27.0
-transformers>=4.40.0
-accelerate>=0.30.0
+# Optional SD Inpainting & LTX-Video Image-to-Video (/i2v)
+diffusers>=0.32.0
+transformers>=4.44.0
+accelerate>=0.33.0
+sentencepiece>=0.2.0
 albumentations>=1.3.0

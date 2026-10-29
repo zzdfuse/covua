@@ -15,10 +15,11 @@ gspread>=6.0.0
 # - Telethon 1.42+: CreateForumTopicRequest moved to messages module
 # The code now correctly imports from messages module for v1.42+
 
-# SD inpainting pipeline (for etcd thread cloth removal)
-diffusers>=0.27.0
-transformers>=4.40.0
-accelerate>=0.30.0
+# SD inpainting & LTX-Video Image-to-Video (/i2v) pipelines
+diffusers>=0.32.0
+transformers>=4.44.0
+accelerate>=0.33.0
+sentencepiece>=0.2.0
 albumentations>=1.3.0
 git+https://github.com/banyapon/pyhelper
 git+https://github.com/banyapon/cloths_segmentation
